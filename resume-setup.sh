@@ -2,7 +2,7 @@
 set -e
 export AWS_PAGER=""
 
-# Configuration
+# Configuration (same as setup-sagemaker.sh)
 REGION="${AWS_REGION:-us-east-1}"
 ACCOUNT_ID="${AWS_ACCOUNT_ID:-418087252133}"
 ECR_REPO="hunyuan3d-sagemaker"
@@ -11,49 +11,25 @@ MODEL_NAME="hunyuan3d-model-v2"
 ENDPOINT_CONFIG_NAME="hunyuan3d-async-config-v2"
 ENDPOINT_NAME="hunyuan3d-async-v2"
 EXECUTION_ROLE_NAME="hunyuan3d-sagemaker-role"
-
-# Instance type: ml.g5.2xlarge (A10G 24GB) or ml.g6.2xlarge (L4 24GB)
 INSTANCE_TYPE="${INSTANCE_TYPE:-ml.g5.2xlarge}"
-
-# S3 buckets for async inference
 INPUT_BUCKET="hackathon-jobs-67"
 OUTPUT_BUCKET="hackathon-jobs-67"
+ECR_URI="$ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com/$ECR_REPO:$IMAGE_TAG"
+ROLE_ARN="arn:aws:iam::$ACCOUNT_ID:role/$EXECUTION_ROLE_NAME"
 
-echo "=== Setting up SageMaker Async Inference for Hunyuan3D ==="
+echo "=== Resuming SageMaker setup from Step 3 ==="
 echo "Region: $REGION"
 echo "Account: $ACCOUNT_ID"
-echo "Instance: $INSTANCE_TYPE (scale-to-zero enabled)"
-
-# Step 1: Create ECR repository if it doesn't exist
-echo ""
-echo "=== Step 1: ECR Repository ==="
-aws ecr describe-repositories --repository-names $ECR_REPO --region $REGION 2>/dev/null || \
-    aws ecr create-repository --repository-name $ECR_REPO --region $REGION
-
-ECR_URI="$ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com/$ECR_REPO:$IMAGE_TAG"
+echo "Instance: $INSTANCE_TYPE"
 echo "ECR URI: $ECR_URI"
-
-# Step 2: Build and push Docker image
-echo ""
-echo "=== Step 2: Build & Push Docker Image ==="
-aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin "$ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com"
-
-# Build for x86_64 and push directly to ECR
-# Use provenance=false to avoid OCI format (SageMaker requires Docker manifest v2)
-docker buildx build --platform linux/amd64 --provenance=false --sbom=false \
-    -f Dockerfile.sagemaker -t $ECR_URI --push .
 
 # Step 3: Create SageMaker execution role
 echo ""
 echo "=== Step 3: SageMaker Execution Role ==="
 
-ROLE_ARN="arn:aws:iam::$ACCOUNT_ID:role/$EXECUTION_ROLE_NAME"
-
-# Check if role exists
-if ! aws iam get-role --role-name $EXECUTION_ROLE_NAME 2>/dev/null; then
+if ! aws iam get-role --role-name $EXECUTION_ROLE_NAME > /dev/null 2>&1; then
     echo "Creating execution role..."
 
-    # Trust policy for SageMaker
     cat > /tmp/sagemaker-trust-policy.json << 'EOF'
 {
     "Version": "2012-10-17",
@@ -73,7 +49,6 @@ EOF
         --role-name $EXECUTION_ROLE_NAME \
         --assume-role-policy-document file:///tmp/sagemaker-trust-policy.json
 
-    # Attach policies
     aws iam attach-role-policy \
         --role-name $EXECUTION_ROLE_NAME \
         --policy-arn arn:aws:iam::aws:policy/AmazonSageMakerFullAccess
@@ -96,7 +71,6 @@ fi
 echo ""
 echo "=== Step 4: SageMaker Model ==="
 
-# Delete existing model if it exists
 aws sagemaker delete-model --model-name $MODEL_NAME --region $REGION 2>/dev/null || true
 
 aws sagemaker create-model \
@@ -111,16 +85,10 @@ echo "Model created: $MODEL_NAME"
 echo ""
 echo "=== Step 5: Endpoint Configuration (Async + Scale-to-Zero) ==="
 
-# Delete existing endpoint config if it exists
 aws sagemaker delete-endpoint-config --endpoint-config-name $ENDPOINT_CONFIG_NAME --region $REGION 2>/dev/null || true
 
-# Instance type: g5.2xlarge (24GB A10G) or g6.2xlarge (24GB L4)
-# Using g5.2xlarge - change to ml.g6.2xlarge if preferred
-INSTANCE_TYPE="${INSTANCE_TYPE:-ml.g5.2xlarge}"
 echo "Instance type: $INSTANCE_TYPE"
 
-# Create endpoint config with async inference + managed scaling (scale to zero)
-# InitialInstanceCount must be >= 1, but managed scaling can scale down to 0
 aws sagemaker create-endpoint-config \
     --endpoint-config-name $ENDPOINT_CONFIG_NAME \
     --production-variants '[
@@ -155,7 +123,6 @@ echo "  - Cold start: ~5-10 minutes when scaling from 0"
 echo ""
 echo "=== Step 6: Create Endpoint ==="
 
-# Delete existing endpoint if it exists
 aws sagemaker delete-endpoint --endpoint-name $ENDPOINT_NAME --region $REGION 2>/dev/null || true
 echo "Waiting for old endpoint to be deleted..."
 sleep 30
@@ -180,9 +147,6 @@ echo "  - Endpoint starts with 0 instances (no cost when idle)"
 echo "  - First request triggers scale-up (~5-10 min cold start)"
 echo "  - Scales back to 0 after ~10-15 min of no requests"
 echo "  - Use submit-job.py to submit inference requests"
-echo ""
-echo "To use g6.2xlarge instead, run:"
-echo "  INSTANCE_TYPE=ml.g6.2xlarge ./setup-sagemaker.sh"
 echo ""
 echo "=== Test the endpoint ==="
 echo "1. Upload a test image:"

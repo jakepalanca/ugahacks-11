@@ -2,7 +2,7 @@
 set -e
 
 REGION="${AWS_REGION:-us-east-1}"
-ENDPOINT_NAME="hunyuan3d-async"
+ENDPOINT_NAME="hunyuan3d-async-v2"
 INPUT_BUCKET="hackathon-images-67"
 OUTPUT_BUCKET="hackathon-jobs-67"
 TEST_IMAGE="inputs/test_image.png"
@@ -63,7 +63,8 @@ echo "=== Submitting Test Job ==="
 echo "This will run both shape and paint stages."
 echo ""
 
-python3 "$(dirname "$0")/submit-job.py" \
+SCRIPT_DIR="$(dirname "$0")"
+"$SCRIPT_DIR/.venv/bin/python3" "$SCRIPT_DIR/submit-job.py" \
     --input "s3://$INPUT_BUCKET/$TEST_IMAGE" \
     --output-prefix "s3://$OUTPUT_BUCKET/jobs/$JOB_ID" \
     --endpoint $ENDPOINT_NAME \

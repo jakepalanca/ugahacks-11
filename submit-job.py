@@ -18,7 +18,7 @@ import time
 import uuid
 import boto3
 
-ENDPOINT_NAME = "hunyuan3d-async"
+ENDPOINT_NAME = "hunyuan3d-async-v2"
 REGION = "us-east-1"
 
 
@@ -160,6 +160,7 @@ def run_single_stage(stage: str, input_s3: str, output_s3: str, shape_s3: str = 
 
 
 def main():
+    global ENDPOINT_NAME, REGION
     parser = argparse.ArgumentParser(description="Submit Hunyuan3D jobs to SageMaker Async")
     parser.add_argument("--stage", choices=["shape", "paint", "full"], default="full",
                        help="Stage to run (default: full pipeline)")
@@ -172,7 +173,6 @@ def main():
 
     args = parser.parse_args()
 
-    global ENDPOINT_NAME, REGION
     ENDPOINT_NAME = args.endpoint
     REGION = args.region
 
