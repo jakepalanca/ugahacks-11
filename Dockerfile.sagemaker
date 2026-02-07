@@ -1,0 +1,81 @@
+FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+WORKDIR /app
+
+# Base deps + OpenGL + Blender dependencies
+RUN apt-get update && apt-get install -y \
+    software-properties-common curl ca-certificates git wget \
+    build-essential pkg-config \
+    libgl1 libglib2.0-0 \
+    libopengl0 libglx0 libglvnd0 libegl1 libglu1-mesa \
+    libxkbcommon0 libxcb-cursor0 libxrender1 libxi6 libxfixes3 \
+    libxxf86vm1 libxkbcommon-x11-0 libsm6 libice6 \
+    xvfb \
+  && rm -rf /var/lib/apt/lists/*
+
+# Install Blender for bpy
+RUN wget -q https://mirror.clarkson.edu/blender/release/Blender4.2/blender-4.2.0-linux-x64.tar.xz \
+    && tar -xf blender-4.2.0-linux-x64.tar.xz \
+    && mv blender-4.2.0-linux-x64 /opt/blender \
+    && rm blender-4.2.0-linux-x64.tar.xz
+
+ENV PATH="/opt/blender:$PATH"
+ENV BLENDER_PATH="/opt/blender"
+
+# Python 3.11 on Ubuntu 22.04
+RUN add-apt-repository ppa:deadsnakes/ppa && apt-get update && apt-get install -y \
+    python3.11 python3.11-venv python3.11-dev \
+  && rm -rf /var/lib/apt/lists/*
+
+# Create venv
+RUN python3.11 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+RUN python --version && pip --version
+RUN pip install --upgrade pip setuptools wheel
+
+# Clone Hunyuan3D repo
+RUN git clone https://github.com/Tencent-Hunyuan/Hunyuan3D-2.1.git .
+
+# Patch outdated package versions - remove bpy from requirements (we'll use Blender's)
+RUN sed -i 's/^bpy==.*$/# bpy - using system Blender/' requirements.txt && \
+    sed -i 's/^pymeshlab==2022.2.post3$/pymeshlab>=2025.7/' requirements.txt
+
+# Torch cu124
+RUN pip install \
+  torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 \
+  --index-url https://download.pytorch.org/whl/cu124
+
+# Install requirements
+RUN pip install \
+  --index-url https://pypi.org/simple \
+  --extra-index-url https://download.blender.org/pypi/ \
+  -r requirements.txt
+
+# Install bpy from Blender's Python
+RUN ln -s /opt/blender/4.2/python/lib/python3.11/site-packages/bpy /opt/venv/lib/python3.11/site-packages/bpy && \
+    ln -s /opt/blender/4.2/python/lib/python3.11/site-packages/_bpy.so /opt/venv/lib/python3.11/site-packages/_bpy.so 2>/dev/null || true
+
+# Alternative: install fake-bpy-module for type hints (bpy stubs)
+RUN pip install fake-bpy-module-4.2 || true
+
+# Flask for SageMaker serving
+RUN pip install flask boto3
+
+# Copy serving script
+COPY serve.py /app/serve.py
+
+# SageMaker expects container to listen on 8080
+EXPOSE 8080
+
+# Environment for SageMaker
+ENV MODEL_PATH="tencent/Hunyuan3D-2.1"
+ENV PRELOAD_MODELS="0"
+
+# Use xvfb for headless OpenGL
+ENV DISPLAY=:99
+
+# Run the Flask server with virtual display
+ENTRYPOINT ["python", "/app/serve.py"]
