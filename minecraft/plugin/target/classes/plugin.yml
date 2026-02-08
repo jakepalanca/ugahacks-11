@@ -1,0 +1,24 @@
+name: CreateBuild
+main: com.hackathon.createbuild.CreateBuildPlugin
+version: 0.1.0
+api-version: "1.20"
+authors:
+  - hackathon
+commands:
+  createbuild:
+    description: Gives a builder stick that starts a prompt + size flow on tap.
+    usage: /createbuild [default prompt]
+    permission: createbuild.use
+  createbuildsize:
+    description: Select small, medium, or large for your pending build.
+    usage: /createbuildsize <small|medium|large>
+    permission: createbuild.use
+  resetworld:
+    description: Delete world files, switch to flat world settings, and restart server.
+    usage: /resetworld confirm
+    aliases: [flatreset, worldreset]
+permissions:
+  createbuild.use:
+    default: true
+  createbuild.admin:
+    default: true

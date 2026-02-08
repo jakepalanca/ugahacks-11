@@ -6,11 +6,18 @@ export AWS_PAGER=""
 REGION="${AWS_REGION:-us-east-1}"
 ACCOUNT_ID="${AWS_ACCOUNT_ID:-418087252133}"
 ECR_REPO="hunyuan3d-sagemaker"
-IMAGE_TAG="v2"
+IMAGE_TAG="${IMAGE_TAG:-v2}"
 MODEL_NAME="hunyuan3d-model-v2"
 ENDPOINT_CONFIG_NAME="hunyuan3d-async-config-v2"
 ENDPOINT_NAME="hunyuan3d-async-v2"
 EXECUTION_ROLE_NAME="hunyuan3d-sagemaker-role"
+PAINT_QUALITY="${PAINT_QUALITY:-high}"
+PAINT_MAX_NUM_VIEW="${PAINT_MAX_NUM_VIEW:-8}"
+PAINT_RESOLUTION="${PAINT_RESOLUTION:-1024}"
+PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+UNLOAD_SHAPE_BEFORE_PAINT="${UNLOAD_SHAPE_BEFORE_PAINT:-1}"
+UNLOAD_PAINT_BEFORE_SHAPE="${UNLOAD_PAINT_BEFORE_SHAPE:-1}"
+KEEP_PAINT_PIPELINE_LOADED="${KEEP_PAINT_PIPELINE_LOADED:-0}"
 
 # Instance type: ml.g5.2xlarge (A10G 24GB) or ml.g6.2xlarge (L4 24GB)
 INSTANCE_TYPE="${INSTANCE_TYPE:-ml.g5.2xlarge}"
@@ -99,11 +106,54 @@ echo "=== Step 4: SageMaker Model ==="
 # Delete existing model if it exists
 aws sagemaker delete-model --model-name $MODEL_NAME --region $REGION 2>/dev/null || true
 
+# Build primary container definition with optional HF token for authenticated Hub access.
+PRIMARY_CONTAINER_JSON="$(mktemp /tmp/hy3d-primary-container.XXXXXX.json)"
+python3 - "$ECR_URI" "${HF_TOKEN:-}" "${PAINT_QUALITY}" "${PAINT_MAX_NUM_VIEW}" "${PAINT_RESOLUTION}" "${PYTORCH_CUDA_ALLOC_CONF}" "${UNLOAD_SHAPE_BEFORE_PAINT}" "${UNLOAD_PAINT_BEFORE_SHAPE}" "${KEEP_PAINT_PIPELINE_LOADED}" > "$PRIMARY_CONTAINER_JSON" <<'PY'
+import json
+import sys
+
+image = sys.argv[1]
+hf_token = sys.argv[2]
+paint_quality = sys.argv[3]
+paint_max_num_view = sys.argv[4]
+paint_resolution = sys.argv[5]
+cuda_alloc_conf = sys.argv[6]
+unload_shape_before_paint = sys.argv[7]
+unload_paint_before_shape = sys.argv[8]
+keep_paint_pipeline_loaded = sys.argv[9]
+
+environment = {
+    "PAINT_QUALITY": paint_quality,
+    "PAINT_MAX_NUM_VIEW": paint_max_num_view,
+    "PAINT_RESOLUTION": paint_resolution,
+    "PYTORCH_CUDA_ALLOC_CONF": cuda_alloc_conf,
+    "UNLOAD_SHAPE_BEFORE_PAINT": unload_shape_before_paint,
+    "UNLOAD_PAINT_BEFORE_SHAPE": unload_paint_before_shape,
+    "KEEP_PAINT_PIPELINE_LOADED": keep_paint_pipeline_loaded,
+}
+if hf_token:
+    environment["HF_TOKEN"] = hf_token
+
+container = {"Image": image, "Environment": environment}
+
+print(json.dumps(container))
+PY
+
+if [ -n "${HF_TOKEN:-}" ]; then
+    echo "Using HF_TOKEN for authenticated Hugging Face downloads."
+else
+    echo "HF_TOKEN not set; relying on model artifacts baked into the image cache."
+fi
+echo "Paint settings: PAINT_QUALITY=${PAINT_QUALITY}, PAINT_MAX_NUM_VIEW=${PAINT_MAX_NUM_VIEW}, PAINT_RESOLUTION=${PAINT_RESOLUTION}"
+echo "Memory settings: PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF}, UNLOAD_SHAPE_BEFORE_PAINT=${UNLOAD_SHAPE_BEFORE_PAINT}, UNLOAD_PAINT_BEFORE_SHAPE=${UNLOAD_PAINT_BEFORE_SHAPE}, KEEP_PAINT_PIPELINE_LOADED=${KEEP_PAINT_PIPELINE_LOADED}"
+
 aws sagemaker create-model \
     --model-name $MODEL_NAME \
-    --primary-container Image=$ECR_URI \
+    --primary-container "file://$PRIMARY_CONTAINER_JSON" \
     --execution-role-arn $ROLE_ARN \
     --region $REGION
+
+rm -f "$PRIMARY_CONTAINER_JSON"
 
 echo "Model created: $MODEL_NAME"
 

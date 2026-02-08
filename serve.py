@@ -10,6 +10,7 @@ import sys
 import json
 import tempfile
 import traceback
+import gc
 
 # Add Hunyuan3D paths
 sys.path.insert(0, '/app/hy3dshape')
@@ -29,6 +30,58 @@ app = flask.Flask(__name__)
 s3 = boto3.client("s3")
 
 MODEL_PATH = os.environ.get("MODEL_PATH", "tencent/Hunyuan3D-2.1")
+UNLOAD_SHAPE_BEFORE_PAINT = os.environ.get("UNLOAD_SHAPE_BEFORE_PAINT", "1") != "0"
+UNLOAD_PAINT_BEFORE_SHAPE = os.environ.get("UNLOAD_PAINT_BEFORE_SHAPE", "1") != "0"
+KEEP_PAINT_PIPELINE_LOADED = os.environ.get("KEEP_PAINT_PIPELINE_LOADED", "0") != "0"
+# Reduce CUDA allocator fragmentation under repeated async requests.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True"))
+
+PAINT_QUALITY_PRESETS = {
+    "low": {"max_num_view": 4, "resolution": 256},
+    "medium": {"max_num_view": 6, "resolution": 512},
+    "high": {"max_num_view": 8, "resolution": 1024},
+    "ultra": {"max_num_view": 10, "resolution": 1536},
+}
+
+
+def _parse_int_env(name: str, default: int, *, minimum: int, maximum: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        value = int(str(raw).strip())
+    except ValueError:
+        print(f"Invalid {name}='{raw}', using default {default}")
+        return default
+    if value < minimum:
+        print(f"{name}={value} below minimum {minimum}; clamping.")
+        return minimum
+    if value > maximum:
+        print(f"{name}={value} above maximum {maximum}; clamping.")
+        return maximum
+    return value
+
+
+def resolve_paint_settings():
+    quality = os.environ.get("PAINT_QUALITY", "high").strip().lower()
+    preset = PAINT_QUALITY_PRESETS.get(quality, PAINT_QUALITY_PRESETS["high"])
+    if quality not in PAINT_QUALITY_PRESETS:
+        print(f"Unknown PAINT_QUALITY '{quality}', using 'high'.")
+        quality = "high"
+
+    max_num_view = _parse_int_env(
+        "PAINT_MAX_NUM_VIEW",
+        preset["max_num_view"],
+        minimum=2,
+        maximum=16,
+    )
+    resolution = _parse_int_env(
+        "PAINT_RESOLUTION",
+        preset["resolution"],
+        minimum=256,
+        maximum=2048,
+    )
+    return quality, max_num_view, resolution
 
 
 def get_rembg():
@@ -54,10 +107,51 @@ def get_paint_pipeline():
     if _paint_pipe is None:
         print("Loading paint pipeline...")
         from textureGenPipeline import Hunyuan3DPaintPipeline, Hunyuan3DPaintConfig
-        _paint_config = Hunyuan3DPaintConfig(max_num_view=6, resolution=512)
+        quality, max_num_view, resolution = resolve_paint_settings()
+        print(
+            "Paint quality settings: "
+            f"quality={quality}, max_num_view={max_num_view}, resolution={resolution}"
+        )
+        _paint_config = Hunyuan3DPaintConfig(max_num_view=max_num_view, resolution=resolution)
         _paint_pipe = Hunyuan3DPaintPipeline(_paint_config)
         print("Paint pipeline loaded.")
     return _paint_pipe
+
+
+def _cuda_cleanup():
+    try:
+        gc.collect()
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            try:
+                torch.cuda.ipc_collect()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def unload_shape_pipeline():
+    global _shape_pipe
+    if _shape_pipe is None:
+        return
+    _shape_pipe = None
+    _cuda_cleanup()
+
+
+def unload_paint_pipeline():
+    global _paint_pipe, _paint_config
+    if _paint_pipe is None and _paint_config is None:
+        return
+    _paint_pipe = None
+    _paint_config = None
+    _cuda_cleanup()
+
+
+def _is_cuda_oom(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return "cuda out of memory" in text or "outofmemoryerror" in text
 
 
 def split_s3_uri(uri: str):
@@ -84,6 +178,94 @@ def upload_to_s3(local_path: str, s3_uri: str):
     s3.upload_file(local_path, bucket, key)
 
 
+def resolve_output_path(output, desired_ext: str = None) -> str:
+    """
+    Resolve pipeline output into a local file path.
+
+    Some Hunyuan pipelines return mesh objects, while others return a path string.
+    """
+    if not isinstance(output, str):
+        raise TypeError(f"Unsupported pipeline output type: {type(output).__name__}")
+
+    if desired_ext:
+        if output.lower().endswith(desired_ext.lower()) and os.path.exists(output):
+            return output
+        root, _ = os.path.splitext(output)
+        candidate = root + desired_ext
+        if os.path.exists(candidate):
+            return candidate
+
+    if os.path.exists(output):
+        return output
+
+    raise FileNotFoundError(f"Pipeline output path does not exist: {output}")
+
+
+def _detect_mesh_file_type(local_path: str) -> str:
+    try:
+        with open(local_path, "rb") as handle:
+            head = handle.read(4096)
+    except Exception:
+        return ""
+
+    if not head:
+        return ""
+    if head.startswith(b"glTF"):
+        return "glb"
+
+    stripped = head.lstrip()
+    lowered = stripped.lower()
+    if lowered.startswith(b"ply"):
+        return "ply"
+    if lowered.startswith(b"solid"):
+        return "stl"
+
+    ascii_head = head.decode("utf-8", errors="ignore").lower()
+    if (
+        ascii_head.startswith("o ")
+        or ascii_head.startswith("v ")
+        or ascii_head.startswith("mtllib ")
+        or "\nmtllib " in ascii_head
+        or "\nv " in ascii_head
+        or "\nvt " in ascii_head
+        or "\nf " in ascii_head
+    ):
+        return "obj"
+    return ""
+
+
+def _is_binary_glb(local_path: str) -> bool:
+    try:
+        with open(local_path, "rb") as handle:
+            return handle.read(4) == b"glTF"
+    except Exception:
+        return False
+
+
+def _ensure_binary_glb(local_path: str, tmpdir: str, label: str) -> str:
+    if _is_binary_glb(local_path):
+        return local_path
+
+    detected = _detect_mesh_file_type(local_path)
+    if detected not in {"obj", "ply", "stl", "glb"}:
+        raise ValueError(f"{label} output is not a valid GLB or supported mesh format: {local_path}")
+
+    print(f"{label} output is '{detected or 'unknown'}'; converting to binary GLB")
+    import trimesh
+
+    if detected and detected != "glb":
+        loaded = trimesh.load(local_path, file_type=detected, force="scene")
+    else:
+        loaded = trimesh.load(local_path, force="scene")
+
+    converted = os.path.join(tmpdir, f"{label}.binary.glb")
+    loaded.export(converted)
+
+    if not _is_binary_glb(converted):
+        raise ValueError(f"{label} conversion did not produce binary GLB")
+    return converted
+
+
 def process_shape(input_s3: str, output_s3: str) -> dict:
     """Generate 3D shape from input image"""
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -105,15 +287,20 @@ def process_shape(input_s3: str, output_s3: str) -> dict:
 
         # Generate shape - returns list, take first mesh
         print("Generating shape...")
+        if UNLOAD_PAINT_BEFORE_SHAPE:
+            unload_paint_pipeline()
         pipe = get_shape_pipeline()
-        mesh = pipe(image=local_input)[0]
+        shape_output = pipe(image=local_input, num_inference_steps=20, octree_resolution=128)[0]
 
         # Save and upload
         local_output = os.path.join(tmpdir, "shape.glb")
-        if hasattr(mesh, 'export'):
-            mesh.export(local_output)
+        if hasattr(shape_output, 'export'):
+            shape_output.export(local_output)
+        elif hasattr(shape_output, 'save'):
+            shape_output.save(local_output)
         else:
-            mesh.save(local_output)
+            local_output = resolve_output_path(shape_output, desired_ext=".glb")
+        local_output = _ensure_binary_glb(local_output, tmpdir, "shape")
 
         upload_to_s3(local_output, output_s3)
 
@@ -142,17 +329,53 @@ def process_paint(input_s3: str, shape_s3: str, output_s3: str) -> dict:
 
         # Generate textured mesh
         print("Applying paint/texture...")
-        pipe = get_paint_pipeline()
-        mesh = pipe(local_shape, image_path=local_input)
+        if UNLOAD_SHAPE_BEFORE_PAINT:
+            unload_shape_pipeline()
+        _cuda_cleanup()
+
+        try:
+            pipe = get_paint_pipeline()
+            paint_output = pipe(local_shape, image_path=local_input)
+        except Exception as exc:
+            if not _is_cuda_oom(exc):
+                raise
+            print(f"Paint OOM with primary settings ({exc}); retrying with fallback settings.")
+            unload_paint_pipeline()
+            _cuda_cleanup()
+
+            from textureGenPipeline import Hunyuan3DPaintPipeline, Hunyuan3DPaintConfig
+
+            _quality, max_num_view, resolution = resolve_paint_settings()
+            fallback_views = max(4, max_num_view - 2)
+            fallback_resolution = max(512, resolution // 2)
+            print(
+                "Fallback paint settings: "
+                f"max_num_view={fallback_views}, resolution={fallback_resolution}"
+            )
+            fallback_config = Hunyuan3DPaintConfig(
+                max_num_view=fallback_views,
+                resolution=fallback_resolution,
+            )
+            fallback_pipe = Hunyuan3DPaintPipeline(fallback_config)
+            paint_output = fallback_pipe(local_shape, image_path=local_input)
+            del fallback_pipe
+            _cuda_cleanup()
 
         # Save and upload
         local_output = os.path.join(tmpdir, "textured.glb")
-        if hasattr(mesh, 'export'):
-            mesh.export(local_output)
+        if hasattr(paint_output, 'export'):
+            paint_output.export(local_output)
+        elif hasattr(paint_output, 'save'):
+            paint_output.save(local_output)
         else:
-            mesh.save(local_output)
+            # Hunyuan3DPaintPipeline returns an .obj path string; it also writes .glb.
+            local_output = resolve_output_path(paint_output, desired_ext=".glb")
+        local_output = _ensure_binary_glb(local_output, tmpdir, "paint")
 
         upload_to_s3(local_output, output_s3)
+
+        if not KEEP_PAINT_PIPELINE_LOADED:
+            unload_paint_pipeline()
 
     return {"status": "success", "stage": "paint", "output": output_s3}
 

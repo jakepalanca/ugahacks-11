@@ -6,7 +6,7 @@ export AWS_PAGER=""
 REGION="${AWS_REGION:-us-east-1}"
 ACCOUNT_ID="${AWS_ACCOUNT_ID:-418087252133}"
 ECR_REPO="hunyuan3d-sagemaker"
-IMAGE_TAG="v2"
+IMAGE_TAG="${IMAGE_TAG:-v2}"
 MODEL_NAME="hunyuan3d-model-v2"
 ENDPOINT_CONFIG_NAME="hunyuan3d-async-config-v2"
 ENDPOINT_NAME="hunyuan3d-async-v2"
@@ -14,6 +14,13 @@ EXECUTION_ROLE_NAME="hunyuan3d-sagemaker-role"
 INSTANCE_TYPE="${INSTANCE_TYPE:-ml.g5.2xlarge}"
 INPUT_BUCKET="hackathon-jobs-67"
 OUTPUT_BUCKET="hackathon-jobs-67"
+PAINT_QUALITY="${PAINT_QUALITY:-high}"
+PAINT_MAX_NUM_VIEW="${PAINT_MAX_NUM_VIEW:-8}"
+PAINT_RESOLUTION="${PAINT_RESOLUTION:-1024}"
+PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+UNLOAD_SHAPE_BEFORE_PAINT="${UNLOAD_SHAPE_BEFORE_PAINT:-1}"
+UNLOAD_PAINT_BEFORE_SHAPE="${UNLOAD_PAINT_BEFORE_SHAPE:-1}"
+KEEP_PAINT_PIPELINE_LOADED="${KEEP_PAINT_PIPELINE_LOADED:-0}"
 ECR_URI="$ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com/$ECR_REPO:$IMAGE_TAG"
 ROLE_ARN="arn:aws:iam::$ACCOUNT_ID:role/$EXECUTION_ROLE_NAME"
 
@@ -73,24 +80,61 @@ echo "=== Step 4: SageMaker Model ==="
 
 aws sagemaker delete-model --model-name $MODEL_NAME --region $REGION 2>/dev/null || true
 
+PRIMARY_CONTAINER_JSON="$(mktemp /tmp/hy3d-primary-container.XXXXXX.json)"
+python3 - "$ECR_URI" "${HF_TOKEN:-}" "${PAINT_QUALITY}" "${PAINT_MAX_NUM_VIEW}" "${PAINT_RESOLUTION}" "${PYTORCH_CUDA_ALLOC_CONF}" "${UNLOAD_SHAPE_BEFORE_PAINT}" "${UNLOAD_PAINT_BEFORE_SHAPE}" "${KEEP_PAINT_PIPELINE_LOADED}" > "$PRIMARY_CONTAINER_JSON" <<'PY'
+import json
+import sys
+
+image = sys.argv[1]
+hf_token = sys.argv[2]
+paint_quality = sys.argv[3]
+paint_max_num_view = sys.argv[4]
+paint_resolution = sys.argv[5]
+cuda_alloc_conf = sys.argv[6]
+unload_shape_before_paint = sys.argv[7]
+unload_paint_before_shape = sys.argv[8]
+keep_paint_pipeline_loaded = sys.argv[9]
+
+environment = {
+    "PAINT_QUALITY": paint_quality,
+    "PAINT_MAX_NUM_VIEW": paint_max_num_view,
+    "PAINT_RESOLUTION": paint_resolution,
+    "PYTORCH_CUDA_ALLOC_CONF": cuda_alloc_conf,
+    "UNLOAD_SHAPE_BEFORE_PAINT": unload_shape_before_paint,
+    "UNLOAD_PAINT_BEFORE_SHAPE": unload_paint_before_shape,
+    "KEEP_PAINT_PIPELINE_LOADED": keep_paint_pipeline_loaded,
+}
+if hf_token:
+    environment["HF_TOKEN"] = hf_token
+
+container = {"Image": image, "Environment": environment}
+print(json.dumps(container))
+PY
+
 aws sagemaker create-model \
     --model-name $MODEL_NAME \
-    --primary-container Image=$ECR_URI \
+    --primary-container "file://$PRIMARY_CONTAINER_JSON" \
     --execution-role-arn $ROLE_ARN \
     --region $REGION
+rm -f "$PRIMARY_CONTAINER_JSON"
 
 echo "Model created: $MODEL_NAME"
+echo "Paint settings: PAINT_QUALITY=${PAINT_QUALITY}, PAINT_MAX_NUM_VIEW=${PAINT_MAX_NUM_VIEW}, PAINT_RESOLUTION=${PAINT_RESOLUTION}"
+echo "Memory settings: PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF}, UNLOAD_SHAPE_BEFORE_PAINT=${UNLOAD_SHAPE_BEFORE_PAINT}, UNLOAD_PAINT_BEFORE_SHAPE=${UNLOAD_PAINT_BEFORE_SHAPE}, KEEP_PAINT_PIPELINE_LOADED=${KEEP_PAINT_PIPELINE_LOADED}"
 
-# Step 5: Create Async Endpoint Configuration
+# Step 5: Create Async Endpoint Configuration (with unique name for updates)
 echo ""
 echo "=== Step 5: Endpoint Configuration (Async + Scale-to-Zero) ==="
 
-aws sagemaker delete-endpoint-config --endpoint-config-name $ENDPOINT_CONFIG_NAME --region $REGION 2>/dev/null || true
+# Use a timestamped config name so update-endpoint always sees a new config
+TIMESTAMP=$(date +%s)
+NEW_CONFIG_NAME="${ENDPOINT_CONFIG_NAME}-${TIMESTAMP}"
 
 echo "Instance type: $INSTANCE_TYPE"
+echo "Config name: $NEW_CONFIG_NAME"
 
 aws sagemaker create-endpoint-config \
-    --endpoint-config-name $ENDPOINT_CONFIG_NAME \
+    --endpoint-config-name $NEW_CONFIG_NAME \
     --production-variants '[
         {
             "VariantName": "AllTraffic",
@@ -115,22 +159,37 @@ aws sagemaker create-endpoint-config \
     }' \
     --region $REGION
 
-echo "Endpoint config created: $ENDPOINT_CONFIG_NAME"
+echo "Endpoint config created: $NEW_CONFIG_NAME"
 echo "  - Scale to zero enabled (MinInstanceCount=0)"
 echo "  - Cold start: ~5-10 minutes when scaling from 0"
 
-# Step 6: Create Endpoint
+# Step 6: Create or Update Endpoint
 echo ""
-echo "=== Step 6: Create Endpoint ==="
+echo "=== Step 6: Create/Update Endpoint ==="
 
-aws sagemaker delete-endpoint --endpoint-name $ENDPOINT_NAME --region $REGION 2>/dev/null || true
-echo "Waiting for old endpoint to be deleted..."
-sleep 30
+EXISTING_CONFIG=$(aws sagemaker describe-endpoint --endpoint-name $ENDPOINT_NAME --region $REGION \
+    --query 'EndpointConfigName' --output text 2>/dev/null || echo "")
 
-aws sagemaker create-endpoint \
-    --endpoint-name $ENDPOINT_NAME \
-    --endpoint-config-name $ENDPOINT_CONFIG_NAME \
-    --region $REGION
+if [ -n "$EXISTING_CONFIG" ] && [ "$EXISTING_CONFIG" != "None" ]; then
+    echo "Endpoint exists (current config: $EXISTING_CONFIG) — updating..."
+    aws sagemaker update-endpoint \
+        --endpoint-name $ENDPOINT_NAME \
+        --endpoint-config-name $NEW_CONFIG_NAME \
+        --region $REGION
+
+    # Clean up the old config so they don't pile up
+    if [ "$EXISTING_CONFIG" != "$NEW_CONFIG_NAME" ]; then
+        echo "Deleting old config: $EXISTING_CONFIG"
+        aws sagemaker delete-endpoint-config \
+            --endpoint-config-name "$EXISTING_CONFIG" --region $REGION 2>/dev/null || true
+    fi
+else
+    echo "Creating new endpoint..."
+    aws sagemaker create-endpoint \
+        --endpoint-name $ENDPOINT_NAME \
+        --endpoint-config-name $NEW_CONFIG_NAME \
+        --region $REGION
+fi
 
 echo ""
 echo "=== Endpoint creation started! ==="

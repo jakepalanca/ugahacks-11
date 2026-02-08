@@ -17,6 +17,7 @@ import json
 import time
 import uuid
 import boto3
+from botocore.exceptions import ClientError
 
 ENDPOINT_NAME = "hunyuan3d-async-v2"
 REGION = "us-east-1"
@@ -74,31 +75,42 @@ def invoke_and_wait(sagemaker_runtime, s3, payload: dict, poll_interval: int = 1
 
     # Poll for result
     print("Waiting for result...")
-    while True:
+    output_parts = output_location.replace("s3://", "").split("/", 1)
+    output_bucket = output_parts[0]
+    output_key = output_parts[1]
+    failure_key = output_key.replace("async-output/", "async-failures/")
+
+    max_wait = 900  # 15 minutes max
+    elapsed = 0
+    while elapsed < max_wait:
         time.sleep(poll_interval)
+        elapsed += poll_interval
 
-        # Parse output location
-        output_parts = output_location.replace("s3://", "").split("/", 1)
-        output_bucket = output_parts[0]
-        output_key = output_parts[1]
-
+        # Check for success output
         try:
             result = s3.get_object(Bucket=output_bucket, Key=output_key)
             body = result["Body"].read().decode("utf-8")
-            return json.loads(body)
-        except s3.exceptions.NoSuchKey:
-            print(".", end="", flush=True)
-            continue
-        except Exception as e:
-            # Check for failure
-            failure_key = output_key.replace("async-output/", "async-failures/")
+            print("")
             try:
-                failure = s3.get_object(Bucket=output_bucket, Key=failure_key)
-                error_body = failure["Body"].read().decode("utf-8")
-                raise RuntimeError(f"Inference failed: {error_body}")
-            except s3.exceptions.NoSuchKey:
-                print(".", end="", flush=True)
-                continue
+                return json.loads(body)
+            except json.JSONDecodeError:
+                print(f"Warning: Got non-JSON response: {body[:200]}")
+                return {"status": "success", "raw_response": body}
+        except ClientError as e:
+            if e.response["Error"]["Code"] not in ("NoSuchKey", "404"):
+                raise
+
+        # Check for failure output
+        try:
+            failure = s3.get_object(Bucket=output_bucket, Key=failure_key)
+            error_body = failure["Body"].read().decode("utf-8")
+            raise RuntimeError(f"Inference failed: {error_body}")
+        except ClientError:
+            pass
+
+        print(".", end="", flush=True)
+
+    raise TimeoutError(f"Inference did not complete within {max_wait}s")
 
 
 def run_pipeline(input_s3: str, output_prefix: str):
@@ -122,6 +134,14 @@ def run_pipeline(input_s3: str, output_prefix: str):
 
     result = invoke_and_wait(sagemaker_runtime, s3, shape_payload)
     print(f"\nShape complete: {result}")
+
+    # Verify shape file exists on S3
+    shape_parts = shape_output.replace("s3://", "").split("/", 1)
+    try:
+        s3.head_object(Bucket=shape_parts[0], Key=shape_parts[1])
+        print(f"Verified shape exists: {shape_output}")
+    except ClientError:
+        raise RuntimeError(f"Shape file not found at {shape_output} after inference completed")
 
     # Stage 2: Paint
     print("\n=== Stage 2: Applying Texture ===")

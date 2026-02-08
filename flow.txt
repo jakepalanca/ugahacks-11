@@ -1,0 +1,6 @@
+Hackathon ec2 instance w/ paper minecraft server makes /createbuild <prompt> which
+gives u a building stick (stick w/ echantment custom). when u tap it a chat pops up asking what you want to build there, how big (small 256 x 256 x 256 medium 512 x 512 and large  2048 x 2048)
+it calls a lambda that uses the hackathon_textToImage lambda and then uses that output as input for this hunyuan 3d sage maker piplein to create 3d textured glb. this glb should
+be voxelized and then the voxels translted to a minecraft setblock commands (chunk it to avoid errors) on the coornidate (anchor it center center bottom ) from where the magic tapped. 
+
+look at hackathon ec2 instance user data and teh s3 bucket wiht config and mods and add stuff there as wlel 
