@@ -33,6 +33,7 @@ MODEL_PATH = os.environ.get("MODEL_PATH", "tencent/Hunyuan3D-2.1")
 UNLOAD_SHAPE_BEFORE_PAINT = os.environ.get("UNLOAD_SHAPE_BEFORE_PAINT", "1") != "0"
 UNLOAD_PAINT_BEFORE_SHAPE = os.environ.get("UNLOAD_PAINT_BEFORE_SHAPE", "1") != "0"
 KEEP_PAINT_PIPELINE_LOADED = os.environ.get("KEEP_PAINT_PIPELINE_LOADED", "0") != "0"
+DISABLE_CUDNN_FOR_PAINT = os.environ.get("DISABLE_CUDNN_FOR_PAINT", "1") != "0"
 # Reduce CUDA allocator fragmentation under repeated async requests.
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True"))
 
@@ -166,6 +167,23 @@ def _cuda_cleanup():
                 pass
     except Exception:
         pass
+
+
+def _set_cudnn_enabled(enabled: bool):
+    try:
+        import torch
+        prev = bool(torch.backends.cudnn.enabled)
+        torch.backends.cudnn.enabled = bool(enabled)
+        torch.backends.cudnn.benchmark = False
+        return prev
+    except Exception:
+        return None
+
+
+def _restore_cudnn_enabled(prev):
+    if prev is None:
+        return
+    _set_cudnn_enabled(bool(prev))
 
 
 def unload_shape_pipeline():
@@ -378,58 +396,66 @@ def process_paint(input_s3: str, shape_s3: str, output_s3: str) -> dict:
         if UNLOAD_SHAPE_BEFORE_PAINT:
             unload_shape_pipeline()
         _cuda_cleanup()
+        cudnn_prev = None
+        if DISABLE_CUDNN_FOR_PAINT:
+            cudnn_prev = _set_cudnn_enabled(False)
+            if cudnn_prev is not None:
+                print("DISABLE_CUDNN_FOR_PAINT=1: torch.backends.cudnn.enabled=False for paint stage.")
 
         try:
-            pipe = get_paint_pipeline()
-            paint_output = pipe(local_shape, image_path=local_input)
-        except Exception as exc:
-            if not _is_cuda_runtime_error(exc):
-                raise
-            print(f"Paint CUDA runtime failure with primary settings ({exc}).")
-            unload_paint_pipeline()
-            _cuda_cleanup()
+            try:
+                pipe = get_paint_pipeline()
+                paint_output = pipe(local_shape, image_path=local_input)
+            except Exception as exc:
+                if not _is_cuda_runtime_error(exc):
+                    raise
+                print(f"Paint CUDA runtime failure with primary settings ({exc}).")
+                unload_paint_pipeline()
+                _cuda_cleanup()
 
-            from textureGenPipeline import Hunyuan3DPaintPipeline, Hunyuan3DPaintConfig
+                from textureGenPipeline import Hunyuan3DPaintPipeline, Hunyuan3DPaintConfig
 
-            _quality, max_num_view, resolution = resolve_paint_settings()
-            fallback_attempts = _build_fallback_paint_attempts(max_num_view, resolution)
-            last_err = exc
-            paint_output = None
+                _quality, max_num_view, resolution = resolve_paint_settings()
+                fallback_attempts = _build_fallback_paint_attempts(max_num_view, resolution)
+                last_err = exc
+                paint_output = None
 
-            for attempt_index, (attempt_views, attempt_resolution) in enumerate(fallback_attempts, start=1):
-                print(
-                    "Retrying paint with fallback settings "
-                    f"(attempt {attempt_index}/{len(fallback_attempts)}): "
-                    f"max_num_view={attempt_views}, resolution={attempt_resolution}"
-                )
-                fallback_pipe = None
-                try:
-                    fallback_config = Hunyuan3DPaintConfig(
-                        max_num_view=attempt_views,
-                        resolution=attempt_resolution,
-                    )
-                    fallback_pipe = Hunyuan3DPaintPipeline(fallback_config)
-                    paint_output = fallback_pipe(local_shape, image_path=local_input)
+                for attempt_index, (attempt_views, attempt_resolution) in enumerate(fallback_attempts, start=1):
                     print(
-                        "Fallback paint attempt succeeded with settings "
+                        "Retrying paint with fallback settings "
+                        f"(attempt {attempt_index}/{len(fallback_attempts)}): "
                         f"max_num_view={attempt_views}, resolution={attempt_resolution}"
                     )
-                    break
-                except Exception as fallback_exc:
-                    if not _is_cuda_runtime_error(fallback_exc):
-                        raise
-                    last_err = fallback_exc
-                    print(
-                        "Fallback paint attempt failed with CUDA runtime error "
-                        f"(max_num_view={attempt_views}, resolution={attempt_resolution}): {fallback_exc}"
-                    )
-                finally:
-                    if fallback_pipe is not None:
-                        del fallback_pipe
-                    _cuda_cleanup()
+                    fallback_pipe = None
+                    try:
+                        fallback_config = Hunyuan3DPaintConfig(
+                            max_num_view=attempt_views,
+                            resolution=attempt_resolution,
+                        )
+                        fallback_pipe = Hunyuan3DPaintPipeline(fallback_config)
+                        paint_output = fallback_pipe(local_shape, image_path=local_input)
+                        print(
+                            "Fallback paint attempt succeeded with settings "
+                            f"max_num_view={attempt_views}, resolution={attempt_resolution}"
+                        )
+                        break
+                    except Exception as fallback_exc:
+                        if not _is_cuda_runtime_error(fallback_exc):
+                            raise
+                        last_err = fallback_exc
+                        print(
+                            "Fallback paint attempt failed with CUDA runtime error "
+                            f"(max_num_view={attempt_views}, resolution={attempt_resolution}): {fallback_exc}"
+                        )
+                    finally:
+                        if fallback_pipe is not None:
+                            del fallback_pipe
+                        _cuda_cleanup()
 
-            if paint_output is None:
-                raise last_err
+                if paint_output is None:
+                    raise last_err
+        finally:
+            _restore_cudnn_enabled(cudnn_prev)
 
         # Save and upload
         local_output = os.path.join(tmpdir, "textured.glb")

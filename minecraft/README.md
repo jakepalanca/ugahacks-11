@@ -28,6 +28,13 @@ cd /Users/jake/hunyuan3d-batch/minecraft
 ./deploy-aws.sh
 ```
 
+`deploy-aws.sh` now clears active queue jobs by default before redeploy (`CLEAR_CREATEBUILD_QUEUE=1`).
+Disable that behavior with:
+
+```bash
+CLEAR_CREATEBUILD_QUEUE=0 ./deploy-aws.sh
+```
+
 Defaults target the live hackathon environment in `us-east-1`:
 
 - S3 assets: `s3://minecraft-config-and-plugins/minecraft/prod/`
@@ -43,6 +50,23 @@ ASSET_BUCKET=minecraft-config-and-plugins \
 ASSET_PREFIX=minecraft/prod \
 CREATEBUILD_API_TOKEN=your-shared-token \
 ./deploy-aws.sh
+```
+
+## Queue + EC2 Recovery Commands
+
+Clear stuck queue jobs and release worker lock:
+
+```bash
+cd /Users/jake/hunyuan3d-batch
+AWS_REGION=us-east-1 JOB_TABLE=createbuild-jobs ./minecraft/clear-createbuild-queue.sh
+```
+
+On the Minecraft EC2 instance (SSH), pull latest assets and restart Paper:
+
+```bash
+sudo /usr/local/bin/minecraft-sync-assets.sh
+sudo systemctl restart minecraft.service
+sudo systemctl status minecraft.service --no-pager
 ```
 
 ## Plugin Build

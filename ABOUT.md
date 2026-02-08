@@ -16,6 +16,7 @@ Uses scale-to-zero auto-scaling (MinInstanceCount=0) so there's no cost when idl
 export HF_TOKEN=<token> # recommended
 ./setup-sagemaker.sh
 INSTANCE_TYPE=ml.g6.2xlarge ./setup-sagemaker.sh   # use L4 GPU instead of A10G
+CLEAR_CREATEBUILD_QUEUE=0 ./setup-sagemaker.sh     # skip queue clear if needed
 
 # Submit a full pipeline job (shape + paint)
 python submit-job.py --input s3://bucket/image.png --output-prefix s3://bucket/jobs/job123
@@ -29,6 +30,13 @@ python submit-job.py --stage paint --input s3://bucket/image.png --shape s3://bu
 
 # Check endpoint status
 aws sagemaker describe-endpoint --endpoint-name hunyuan3d-async-v2 --region us-east-1
+
+# Clear createbuild queue + release worker lock
+AWS_REGION=us-east-1 JOB_TABLE=createbuild-jobs ./minecraft/clear-createbuild-queue.sh
+
+# On EC2 (SSH): sync latest assets and restart Paper server
+sudo /usr/local/bin/minecraft-sync-assets.sh
+sudo systemctl restart minecraft.service
 
 # Tear down all SageMaker resources
 ./cleanup-sagemaker.sh

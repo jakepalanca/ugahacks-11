@@ -2,6 +2,8 @@
 set -e
 export AWS_PAGER=""
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
 # Configuration (same as setup-sagemaker.sh)
 REGION="${AWS_REGION:-us-east-1}"
 ACCOUNT_ID="${AWS_ACCOUNT_ID:-418087252133}"
@@ -21,6 +23,11 @@ PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 UNLOAD_SHAPE_BEFORE_PAINT="${UNLOAD_SHAPE_BEFORE_PAINT:-1}"
 UNLOAD_PAINT_BEFORE_SHAPE="${UNLOAD_PAINT_BEFORE_SHAPE:-1}"
 KEEP_PAINT_PIPELINE_LOADED="${KEEP_PAINT_PIPELINE_LOADED:-0}"
+DISABLE_CUDNN_FOR_PAINT="${DISABLE_CUDNN_FOR_PAINT:-1}"
+SKIP_MESH_INPAINT="${SKIP_MESH_INPAINT:-1}"
+CLEAR_CREATEBUILD_QUEUE="${CLEAR_CREATEBUILD_QUEUE:-1}"
+JOB_TABLE="${JOB_TABLE:-createbuild-jobs}"
+WORKER_LOCK_KEY="${WORKER_LOCK_KEY:-__worker_lock__}"
 ECR_URI="$ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com/$ECR_REPO:$IMAGE_TAG"
 ROLE_ARN="arn:aws:iam::$ACCOUNT_ID:role/$EXECUTION_ROLE_NAME"
 
@@ -29,6 +36,19 @@ echo "Region: $REGION"
 echo "Account: $ACCOUNT_ID"
 echo "Instance: $INSTANCE_TYPE"
 echo "ECR URI: $ECR_URI"
+
+if [ "${CLEAR_CREATEBUILD_QUEUE}" = "1" ]; then
+    echo ""
+    echo "=== Step 0: Clear CreateBuild Queue ==="
+    if [ -x "${SCRIPT_DIR}/minecraft/clear-createbuild-queue.sh" ]; then
+        if ! AWS_REGION="${REGION}" JOB_TABLE="${JOB_TABLE}" WORKER_LOCK_KEY="${WORKER_LOCK_KEY}" \
+            "${SCRIPT_DIR}/minecraft/clear-createbuild-queue.sh"; then
+            echo "WARN: queue clear failed; continuing SageMaker resume setup." >&2
+        fi
+    else
+        echo "WARN: ${SCRIPT_DIR}/minecraft/clear-createbuild-queue.sh not found; skipping queue clear." >&2
+    fi
+fi
 
 # Step 3: Create SageMaker execution role
 echo ""
@@ -81,7 +101,7 @@ echo "=== Step 4: SageMaker Model ==="
 aws sagemaker delete-model --model-name $MODEL_NAME --region $REGION 2>/dev/null || true
 
 PRIMARY_CONTAINER_JSON="$(mktemp /tmp/hy3d-primary-container.XXXXXX.json)"
-python3 - "$ECR_URI" "${HF_TOKEN:-}" "${PAINT_QUALITY}" "${PAINT_MAX_NUM_VIEW}" "${PAINT_RESOLUTION}" "${PYTORCH_CUDA_ALLOC_CONF}" "${UNLOAD_SHAPE_BEFORE_PAINT}" "${UNLOAD_PAINT_BEFORE_SHAPE}" "${KEEP_PAINT_PIPELINE_LOADED}" > "$PRIMARY_CONTAINER_JSON" <<'PY'
+python3 - "$ECR_URI" "${HF_TOKEN:-}" "${PAINT_QUALITY}" "${PAINT_MAX_NUM_VIEW}" "${PAINT_RESOLUTION}" "${PYTORCH_CUDA_ALLOC_CONF}" "${UNLOAD_SHAPE_BEFORE_PAINT}" "${UNLOAD_PAINT_BEFORE_SHAPE}" "${KEEP_PAINT_PIPELINE_LOADED}" "${DISABLE_CUDNN_FOR_PAINT}" "${SKIP_MESH_INPAINT}" > "$PRIMARY_CONTAINER_JSON" <<'PY'
 import json
 import sys
 
@@ -94,6 +114,8 @@ cuda_alloc_conf = sys.argv[6]
 unload_shape_before_paint = sys.argv[7]
 unload_paint_before_shape = sys.argv[8]
 keep_paint_pipeline_loaded = sys.argv[9]
+disable_cudnn_for_paint = sys.argv[10]
+skip_mesh_inpaint = sys.argv[11]
 
 environment = {
     "PAINT_QUALITY": paint_quality,
@@ -101,8 +123,10 @@ environment = {
     "PAINT_RESOLUTION": paint_resolution,
     "PYTORCH_CUDA_ALLOC_CONF": cuda_alloc_conf,
     "UNLOAD_SHAPE_BEFORE_PAINT": unload_shape_before_paint,
-    "UNLOAD_PAINT_BEFORE_SHAPE": unload_paint_before_shape,
+    "UNLOAD_PAINT_BEFORE_SHAPE": unload_paint_before_paint,
     "KEEP_PAINT_PIPELINE_LOADED": keep_paint_pipeline_loaded,
+    "DISABLE_CUDNN_FOR_PAINT": disable_cudnn_for_paint,
+    "SKIP_MESH_INPAINT": skip_mesh_inpaint,
 }
 if hf_token:
     environment["HF_TOKEN"] = hf_token
@@ -120,7 +144,7 @@ rm -f "$PRIMARY_CONTAINER_JSON"
 
 echo "Model created: $MODEL_NAME"
 echo "Paint settings: PAINT_QUALITY=${PAINT_QUALITY}, PAINT_MAX_NUM_VIEW=${PAINT_MAX_NUM_VIEW}, PAINT_RESOLUTION=${PAINT_RESOLUTION}"
-echo "Memory settings: PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF}, UNLOAD_SHAPE_BEFORE_PAINT=${UNLOAD_SHAPE_BEFORE_PAINT}, UNLOAD_PAINT_BEFORE_SHAPE=${UNLOAD_PAINT_BEFORE_SHAPE}, KEEP_PAINT_PIPELINE_LOADED=${KEEP_PAINT_PIPELINE_LOADED}"
+echo "Memory settings: PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF}, UNLOAD_SHAPE_BEFORE_PAINT=${UNLOAD_SHAPE_BEFORE_PAINT}, UNLOAD_PAINT_BEFORE_SHAPE=${UNLOAD_PAINT_BEFORE_SHAPE}, KEEP_PAINT_PIPELINE_LOADED=${KEEP_PAINT_PIPELINE_LOADED}, DISABLE_CUDNN_FOR_PAINT=${DISABLE_CUDNN_FOR_PAINT}, SKIP_MESH_INPAINT=${SKIP_MESH_INPAINT}"
 
 # Step 5: Create Async Endpoint Configuration (with unique name for updates)
 echo ""
@@ -213,3 +237,8 @@ echo "   aws s3 cp your-image.png s3://hackathon-images-67/inputs/test_image.png
 echo ""
 echo "2. Run the test (after endpoint is InService):"
 echo "   ./test-endpoint.sh"
+echo ""
+echo "Queue clear command:"
+echo "  AWS_REGION=$REGION JOB_TABLE=$JOB_TABLE ${SCRIPT_DIR}/minecraft/clear-createbuild-queue.sh"
+echo "EC2 sync/restart (run via SSH):"
+echo "  sudo /usr/local/bin/minecraft-sync-assets.sh && sudo systemctl restart minecraft.service"

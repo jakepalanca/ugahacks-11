@@ -711,16 +711,25 @@ def handler(event, _context):
     if not job_id:
         raise ValueError("job_id is required")
 
+    job = _read_job(job_id)
+    current_status = str(job.get("status", "UNKNOWN")).upper()
+    if current_status in {"FAILED", "SUCCEEDED", "CANCELED"}:
+        # Ignore duplicate async invokes for terminal jobs.
+        return {"job_id": job_id, "status": current_status, "skipped": True}
+
     if not _acquire_worker_lock(job_id):
-        _update_job(
-            job_id,
-            {
-                "status": "QUEUED",
-                "progress_stage": "queued",
-                "progress_message": "Build queued. Waiting for active build slot...",
-            },
-        )
-        return {"job_id": job_id, "status": "QUEUED", "deferred": True}
+        current_status = str(_read_job(job_id).get("status", "UNKNOWN")).upper()
+        if current_status in {"QUEUED", "STARTING"}:
+            _update_job(
+                job_id,
+                {
+                    "status": "QUEUED",
+                    "progress_stage": "queued",
+                    "progress_message": "Build queued. Waiting for active build slot...",
+                },
+            )
+            return {"job_id": job_id, "status": "QUEUED", "deferred": True}
+        return {"job_id": job_id, "status": current_status, "skipped": True}
 
     if not _transition_job_to_running(job_id):
         current_status = str(_read_job(job_id).get("status", "UNKNOWN")).upper()

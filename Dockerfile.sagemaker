@@ -126,6 +126,23 @@ RUN pip install pybind11 && \
       -o "mesh_inpaint_processor${EXT_SUFFIX}" && \
     python -c "import sys; sys.path.insert(0, '/app/hy3dpaint'); from DifferentiableRenderer.mesh_inpaint_processor import meshVerticeInpaint; print('mesh_inpaint_processor OK')"
 
+# Patch: skip extremely slow meshVerticeInpaint (takes hours per mesh).
+# Keeps cv2.inpaint (Navier-Stokes, seconds) for adequate hole-filling.
+# Controlled by SKIP_MESH_INPAINT env var at runtime.
+# See: https://github.com/Tencent-Hunyuan/Hunyuan3D-2.1/issues/139
+RUN python3 -c "\
+import pathlib, re; \
+p = pathlib.Path('/app/hy3dpaint/DifferentiableRenderer/MeshRender.py'); \
+src = p.read_text(); \
+src = 'import os as _os\n' + src; \
+src = src.replace( \
+    'if vertex_inpaint:', \
+    'if vertex_inpaint and _os.environ.get(\"SKIP_MESH_INPAINT\", \"0\") != \"1\":', \
+    1 \
+); \
+p.write_text(src); \
+print('Patched MeshRender.py: meshVerticeInpaint gated by SKIP_MESH_INPAINT env var')"
+
 # Download RealESRGAN checkpoint needed by hy3dpaint super-resolution
 RUN mkdir -p /app/ckpt && \
     wget -q -O /app/ckpt/RealESRGAN_x4plus.pth \
@@ -150,6 +167,8 @@ ENV PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 ENV UNLOAD_SHAPE_BEFORE_PAINT="1"
 ENV UNLOAD_PAINT_BEFORE_SHAPE="1"
 ENV KEEP_PAINT_PIPELINE_LOADED="0"
+ENV DISABLE_CUDNN_FOR_PAINT="1"
+ENV SKIP_MESH_INPAINT="1"
 
 # Use xvfb for headless OpenGL
 ENV DISPLAY=:99

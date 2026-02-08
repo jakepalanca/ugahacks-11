@@ -65,6 +65,7 @@ WORKER_RESERVED_CONCURRENCY="${WORKER_RESERVED_CONCURRENCY:-none}"
 WORKER_LOCK_KEY="${WORKER_LOCK_KEY:-__worker_lock__}"
 WORKER_LOCK_TTL_SECONDS="${WORKER_LOCK_TTL_SECONDS:-1200}"
 WORKER_LOCK_STALE_SECONDS="${WORKER_LOCK_STALE_SECONDS:-1800}"
+CLEAR_CREATEBUILD_QUEUE="${CLEAR_CREATEBUILD_QUEUE:-1}"
 
 ASSET_BUCKET="${ASSET_BUCKET:-minecraft-config-and-plugins}"
 ASSET_PREFIX="${ASSET_PREFIX:-minecraft/prod}"
@@ -253,6 +254,16 @@ aws dynamodb update-time-to-live \
   --table-name "${JOB_TABLE}" \
   --time-to-live-specification "Enabled=true,AttributeName=expires_at" \
   --region "${REGION}" >/dev/null 2>&1 || true
+
+if [ "${CLEAR_CREATEBUILD_QUEUE}" = "1" ]; then
+  if [ -x "${SCRIPT_DIR}/clear-createbuild-queue.sh" ]; then
+    echo "Clearing active queue items in ${JOB_TABLE}"
+    JOB_TABLE="${JOB_TABLE}" WORKER_LOCK_KEY="${WORKER_LOCK_KEY}" AWS_REGION="${REGION}" \
+      "${SCRIPT_DIR}/clear-createbuild-queue.sh"
+  else
+    echo "WARN: ${SCRIPT_DIR}/clear-createbuild-queue.sh is missing; skipping queue clear." >&2
+  fi
+fi
 
 TABLE_ARN="$(aws dynamodb describe-table --table-name "${JOB_TABLE}" --region "${REGION}" --query 'Table.TableArn' --output text)"
 ENDPOINT_ARN="arn:aws:sagemaker:${REGION}:${ACCOUNT_ID}:endpoint/${HUNYUAN_ENDPOINT}"
@@ -587,3 +598,5 @@ echo "API ID: ${API_ID}"
 echo "Submit URL: ${SUBMIT_URL}"
 echo "Status URL base: ${STATUS_URL}"
 echo "Asset bucket/prefix: s3://${ASSET_BUCKET}/${ASSET_PREFIX}"
+echo "Queue clear command: AWS_REGION=${REGION} JOB_TABLE=${JOB_TABLE} ${SCRIPT_DIR}/clear-createbuild-queue.sh"
+echo "EC2 sync/restart (run via SSH): sudo /usr/local/bin/minecraft-sync-assets.sh && sudo systemctl restart minecraft.service"

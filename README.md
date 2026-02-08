@@ -13,8 +13,6 @@
 
 Instead of placing blocks manually, a player joins our server, runs a command to receive a **magical wand**, clicks the ground, types a prompt like *"a giant bulldog with a top hat,"* chooses a scale, and the system generates a **voxelized 3D model** and builds it **next to the player** in-game.
 
-This project was inspired by our two “CS personalities”: the builder who loses hours in Minecraft and the engineer fascinated by breakthroughs in generative AI. We wanted to merge those worlds into one seamless experience.
-
 ---
 
 ## What It Does
@@ -95,7 +93,7 @@ We used and integrated the following public tools/frameworks/APIs:
 
 ## Challenges We Ran Into (and How We Overcame Them)
 
-### Dependency Hell (Local → Cloud Migration)
+### Dependencys
 **Problem:** Our prototype depended on many heavy Python modules. When we tried moving to AWS Lambda, the runtime didn’t support our dependencies.  
 **Solution:** We pivoted to **SageMaker + Docker**, which gave us full control over system libraries and Python packages.
 
@@ -115,7 +113,7 @@ We used and integrated the following public tools/frameworks/APIs:
 
 ## Accomplishments That We're Proud Of
 
-### Taming SageMaker
+### SageMaker
 Successfully configuring a **SageMaker Docker environment** that could run our AI pipeline reliably was our biggest technical win.
 
 ### The “First Block” Moment
