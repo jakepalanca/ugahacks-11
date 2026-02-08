@@ -24,6 +24,21 @@ def _is_paint_oom_error(exc: Exception) -> bool:
     return "cuda out of memory" in text or "outofmemoryerror" in text
 
 
+def _is_recoverable_paint_cuda_error(exc: Exception) -> bool:
+    text = str(exc or "").lower()
+    if _is_paint_oom_error(exc):
+        return True
+    patterns = (
+        "cuda driver error",
+        "cuda error",
+        "invalid argument",
+        "cudnn error",
+        "cublas_status_alloc_failed",
+        "device-side assert",
+    )
+    return any(pattern in text for pattern in patterns)
+
+
 def _poll_async_output(
     s3_client,
     output_location: str,
@@ -180,6 +195,7 @@ def run_full_pipeline(
         )
         if callable(progress_hook):
             progress_hook("paint_done")
+
         return {
             "shape_s3": shape_s3,
             "textured_s3": textured_s3,
@@ -187,13 +203,18 @@ def run_full_pipeline(
             "paint_error": "",
         }
     except Exception as exc:
-        if not _is_paint_oom_error(exc):
+        if not _is_recoverable_paint_cuda_error(exc):
             raise
         if callable(progress_hook):
-            progress_hook("paint_oom_fallback")
+            progress_hook("paint_fallback")
+        fallback_reason = (
+            "shape_mesh_due_to_paint_oom"
+            if _is_paint_oom_error(exc)
+            else "shape_mesh_due_to_paint_cuda_error"
+        )
         return {
             "shape_s3": shape_s3,
             "textured_s3": shape_s3,
-            "paint_fallback": "shape_mesh_due_to_paint_oom",
+            "paint_fallback": fallback_reason,
             "paint_error": str(exc)[:1200],
         }

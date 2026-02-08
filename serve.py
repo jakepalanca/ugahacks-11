@@ -37,10 +37,12 @@ KEEP_PAINT_PIPELINE_LOADED = os.environ.get("KEEP_PAINT_PIPELINE_LOADED", "0") !
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True"))
 
 PAINT_QUALITY_PRESETS = {
-    "low": {"max_num_view": 4, "resolution": 256},
-    "medium": {"max_num_view": 6, "resolution": 512},
-    "high": {"max_num_view": 8, "resolution": 1024},
-    "ultra": {"max_num_view": 10, "resolution": 1536},
+    # Hunyuan3D-Paint 2.1 supported ranges:
+    # max_num_view: 6-12, resolution: 512 or 768.
+    "low": {"max_num_view": 6, "resolution": 512},
+    "medium": {"max_num_view": 8, "resolution": 512},
+    "high": {"max_num_view": 9, "resolution": 768},
+    "ultra": {"max_num_view": 12, "resolution": 768},
 }
 
 
@@ -63,25 +65,59 @@ def _parse_int_env(name: str, default: int, *, minimum: int, maximum: int) -> in
 
 
 def resolve_paint_settings():
-    quality = os.environ.get("PAINT_QUALITY", "high").strip().lower()
-    preset = PAINT_QUALITY_PRESETS.get(quality, PAINT_QUALITY_PRESETS["high"])
+    quality = os.environ.get("PAINT_QUALITY", "medium").strip().lower()
+    preset = PAINT_QUALITY_PRESETS.get(quality, PAINT_QUALITY_PRESETS["medium"])
     if quality not in PAINT_QUALITY_PRESETS:
-        print(f"Unknown PAINT_QUALITY '{quality}', using 'high'.")
-        quality = "high"
+        print(f"Unknown PAINT_QUALITY '{quality}', using 'medium'.")
+        quality = "medium"
 
-    max_num_view = _parse_int_env(
+    raw_max_num_view = _parse_int_env(
         "PAINT_MAX_NUM_VIEW",
         preset["max_num_view"],
-        minimum=2,
-        maximum=16,
+        minimum=6,
+        maximum=12,
     )
-    resolution = _parse_int_env(
+    if raw_max_num_view < 6:
+        max_num_view = 6
+    elif raw_max_num_view > 12:
+        max_num_view = 12
+    else:
+        max_num_view = raw_max_num_view
+
+    raw_resolution = _parse_int_env(
         "PAINT_RESOLUTION",
         preset["resolution"],
-        minimum=256,
-        maximum=2048,
+        minimum=512,
+        maximum=768,
     )
+    resolution = 768 if raw_resolution >= 640 else 512
+    if raw_resolution not in (512, 768):
+        print(
+            f"PAINT_RESOLUTION={raw_resolution} is unsupported; "
+            f"using nearest supported value {resolution}."
+        )
     return quality, max_num_view, resolution
+
+
+def _build_fallback_paint_attempts(base_views: int, base_resolution: int):
+    """
+    Return progressively lighter paint settings for CUDA runtime retries.
+    """
+    candidates = [
+        (min(12, max(6, base_views)), 768 if base_resolution >= 640 else 512),
+        (min(12, max(6, base_views - 1)), 512),
+        (6, 512),
+    ]
+
+    attempts = []
+    seen = set()
+    for views, resolution in candidates:
+        key = (int(views), int(resolution))
+        if key in seen:
+            continue
+        seen.add(key)
+        attempts.append(key)
+    return attempts
 
 
 def get_rembg():
@@ -149,9 +185,19 @@ def unload_paint_pipeline():
     _cuda_cleanup()
 
 
-def _is_cuda_oom(exc: Exception) -> bool:
+def _is_cuda_runtime_error(exc: Exception) -> bool:
     text = str(exc).lower()
-    return "cuda out of memory" in text or "outofmemoryerror" in text
+    patterns = (
+        "cuda out of memory",
+        "outofmemoryerror",
+        "cuda driver error",
+        "cuda error",
+        "invalid argument",
+        "cudnn error",
+        "cublas_status_alloc_failed",
+        "device-side assert",
+    )
+    return any(pattern in text for pattern in patterns)
 
 
 def split_s3_uri(uri: str):
@@ -337,29 +383,53 @@ def process_paint(input_s3: str, shape_s3: str, output_s3: str) -> dict:
             pipe = get_paint_pipeline()
             paint_output = pipe(local_shape, image_path=local_input)
         except Exception as exc:
-            if not _is_cuda_oom(exc):
+            if not _is_cuda_runtime_error(exc):
                 raise
-            print(f"Paint OOM with primary settings ({exc}); retrying with fallback settings.")
+            print(f"Paint CUDA runtime failure with primary settings ({exc}).")
             unload_paint_pipeline()
             _cuda_cleanup()
 
             from textureGenPipeline import Hunyuan3DPaintPipeline, Hunyuan3DPaintConfig
 
             _quality, max_num_view, resolution = resolve_paint_settings()
-            fallback_views = max(4, max_num_view - 2)
-            fallback_resolution = max(512, resolution // 2)
-            print(
-                "Fallback paint settings: "
-                f"max_num_view={fallback_views}, resolution={fallback_resolution}"
-            )
-            fallback_config = Hunyuan3DPaintConfig(
-                max_num_view=fallback_views,
-                resolution=fallback_resolution,
-            )
-            fallback_pipe = Hunyuan3DPaintPipeline(fallback_config)
-            paint_output = fallback_pipe(local_shape, image_path=local_input)
-            del fallback_pipe
-            _cuda_cleanup()
+            fallback_attempts = _build_fallback_paint_attempts(max_num_view, resolution)
+            last_err = exc
+            paint_output = None
+
+            for attempt_index, (attempt_views, attempt_resolution) in enumerate(fallback_attempts, start=1):
+                print(
+                    "Retrying paint with fallback settings "
+                    f"(attempt {attempt_index}/{len(fallback_attempts)}): "
+                    f"max_num_view={attempt_views}, resolution={attempt_resolution}"
+                )
+                fallback_pipe = None
+                try:
+                    fallback_config = Hunyuan3DPaintConfig(
+                        max_num_view=attempt_views,
+                        resolution=attempt_resolution,
+                    )
+                    fallback_pipe = Hunyuan3DPaintPipeline(fallback_config)
+                    paint_output = fallback_pipe(local_shape, image_path=local_input)
+                    print(
+                        "Fallback paint attempt succeeded with settings "
+                        f"max_num_view={attempt_views}, resolution={attempt_resolution}"
+                    )
+                    break
+                except Exception as fallback_exc:
+                    if not _is_cuda_runtime_error(fallback_exc):
+                        raise
+                    last_err = fallback_exc
+                    print(
+                        "Fallback paint attempt failed with CUDA runtime error "
+                        f"(max_num_view={attempt_views}, resolution={attempt_resolution}): {fallback_exc}"
+                    )
+                finally:
+                    if fallback_pipe is not None:
+                        del fallback_pipe
+                    _cuda_cleanup()
+
+            if paint_output is None:
+                raise last_err
 
         # Save and upload
         local_output = os.path.join(tmpdir, "textured.glb")

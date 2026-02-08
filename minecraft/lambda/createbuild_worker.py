@@ -746,8 +746,12 @@ def handler(event, _context):
                 _set_progress(job_id, "shape_generation", "Image generated. Building 3D mesh...")
             elif stage == "paint_start":
                 _set_progress(job_id, "texture_paint", "Mesh ready. Painting 3D texture...")
-            elif stage == "paint_oom_fallback":
-                _set_progress(job_id, "texture_paint", "Paint stage hit GPU memory limit. Using shape fallback for build continuity...")
+            elif stage == "paint_fallback":
+                _set_progress(
+                    job_id,
+                    "texture_paint",
+                    "Paint stage hit a GPU error. Continuing with mesh-only fallback...",
+                )
 
         outputs = run_full_pipeline(
             input_s3=image_s3,
