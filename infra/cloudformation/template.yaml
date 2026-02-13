@@ -1,0 +1,1065 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "CreateBuild full stack: Minecraft server + AI backend pipeline (Lambda + API + SageMaker + EC2)."
+
+Parameters:
+  NamePrefix:
+    Type: String
+    Default: createbuild-prod
+    Description: "Lowercase prefix applied to all named resources."
+    AllowedPattern: "^[a-z][a-z0-9-]{2,24}$"
+
+  AssetsPrefix:
+    Type: String
+    Default: minecraft/prod
+    Description: "Prefix inside the assets bucket used by the Minecraft server."
+
+  ApiStageName:
+    Type: String
+    Default: prod
+    AllowedPattern: "^[a-zA-Z0-9_-]{1,20}$"
+
+  ApiToken:
+    Type: String
+    Default: ""
+    NoEcho: true
+    Description: "Bearer token for submit/status API routes. Required unless AllowUnauthenticatedApi=true."
+
+  AllowUnauthenticatedApi:
+    Type: String
+    Default: "false"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: "Set true only for temporary testing. false requires ApiToken for submit/status routes."
+
+  ExistingSageMakerEndpointName:
+    Type: String
+    Default: hunyuan3d-async-v2
+    Description: "Used when SageMakerImageUri is empty."
+
+  SageMakerImageUri:
+    Type: String
+    Default: ""
+    Description: "If set, CloudFormation creates Model/Endpoint using this ECR image URI."
+
+  SageMakerInstanceType:
+    Type: String
+    Default: ml.g5.2xlarge
+
+  WorkerMemorySize:
+    Type: Number
+    Default: 3008
+    MinValue: 128
+    MaxValue: 10240
+
+  WorkerReservedConcurrency:
+    Type: Number
+    Default: -1
+    Description: "Set to -1 for unlimited."
+
+  JobTtlSeconds:
+    Type: Number
+    Default: 604800
+
+  DefaultWorld:
+    Type: String
+    Default: world
+
+  WorkerLockKey:
+    Type: String
+    Default: __worker_lock__
+
+  WorkerLockTtlSeconds:
+    Type: Number
+    Default: 1200
+
+  WorkerLockStaleSeconds:
+    Type: Number
+    Default: 1800
+
+  CommandPrefix:
+    Type: String
+    Default: minecraft-builds
+
+  CommandChunkSize:
+    Type: Number
+    Default: 1024
+
+  PlacementPasses:
+    Type: Number
+    Default: 2
+
+  EnableForceload:
+    Type: String
+    Default: "0"
+    AllowedValues:
+      - "0"
+      - "1"
+
+  MaxForceloadChunks:
+    Type: Number
+    Default: 256
+
+  OrientationRotateYQuarterTurns:
+    Type: Number
+    Default: 0
+
+  SageMakerTimeoutSeconds:
+    Type: Number
+    Default: 840
+
+  SageMakerPollSeconds:
+    Type: Number
+    Default: 8
+
+  TextToImageOutputPrefix:
+    Type: String
+    Default: images/
+
+  GlbLayerBucketName:
+    Type: String
+    Default: ""
+    Description: "Optional external bucket containing sci layer zip. Leave empty to use PipelineBucket."
+
+  GlbLayerObjectKey:
+    Type: String
+    Default: layers/sci_tri_num_pillow.zip
+
+  GlbOutputPrefix:
+    Type: String
+    Default: outputs
+
+  GlbCoordinateMode:
+    Type: String
+    Default: XYZ
+
+  GlbSmallTargetSpan:
+    Type: Number
+    Default: 128
+
+  GlbMediumTargetSpan:
+    Type: Number
+    Default: 192
+
+  GlbLargeTargetSpan:
+    Type: Number
+    Default: 256
+
+  GlbSmallSurfaceSamples:
+    Type: Number
+    Default: 240000
+
+  GlbMediumSurfaceSamples:
+    Type: Number
+    Default: 420000
+
+  GlbLargeSurfaceSamples:
+    Type: Number
+    Default: 700000
+
+  GlbMorphCloseIterations:
+    Type: Number
+    Default: 2
+
+  GlbMorphDilateIterations:
+    Type: Number
+    Default: 1
+
+  GlbAlphaCutout:
+    Type: Number
+    Default: 20
+
+  GlbAlphaGlassMax:
+    Type: Number
+    Default: 210
+
+  GlbUseTextureAlpha:
+    Type: String
+    Default: "0"
+    AllowedValues:
+      - "0"
+      - "1"
+
+  GlbKeepLargestComponent:
+    Type: String
+    Default: "0"
+    AllowedValues:
+      - "0"
+      - "1"
+
+  GlbMinComponentVoxels:
+    Type: Number
+    Default: 1
+
+  GlbUpAxisMode:
+    Type: String
+    Default: AUTO
+
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+
+  MinecraftAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64
+
+  MinecraftInstanceType:
+    Type: String
+    Default: t3a.large
+
+  MinecraftRootVolumeGiB:
+    Type: Number
+    Default: 64
+
+  MinecraftIngressCidr:
+    Type: String
+    Default: 0.0.0.0/0
+
+  AdminIngressCidr:
+    Type: String
+    Default: 0.0.0.0/0
+
+  Ec2KeyPairName:
+    Type: String
+    Default: ""
+
+  AllocateElasticIp:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+
+Conditions:
+  UseWorkerReservedConcurrency: !Not [!Equals [!Ref WorkerReservedConcurrency, -1]]
+  UseExternalGlbLayerBucket: !Not [!Equals [!Ref GlbLayerBucketName, ""]]
+  UseProvidedEc2KeyPair: !Not [!Equals [!Ref Ec2KeyPairName, ""]]
+  CreateSageMakerResources: !Not [!Equals [!Ref SageMakerImageUri, ""]]
+  AllowUnauthenticatedApiCondition: !Equals [!Ref AllowUnauthenticatedApi, "true"]
+  AllocateElasticIpCondition: !Equals [!Ref AllocateElasticIp, "true"]
+
+Resources:
+  AssetsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketName: !Sub "${NamePrefix}-${AWS::AccountId}-${AWS::Region}-assets"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      VersioningConfiguration:
+        Status: Suspended
+      Tags:
+        - Key: Name
+          Value: !Sub "${NamePrefix}-assets-bucket"
+
+  PipelineBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketName: !Sub "${NamePrefix}-${AWS::AccountId}-${AWS::Region}-pipeline"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      VersioningConfiguration:
+        Status: Suspended
+      Tags:
+        - Key: Name
+          Value: !Sub "${NamePrefix}-pipeline-bucket"
+
+  JobTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TableName: !Sub "${NamePrefix}-jobs"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: job_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: job_id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${NamePrefix}-jobs-table"
+
+  SubmitLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${NamePrefix}-submit-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: !Sub "${NamePrefix}-submit-policy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: JobsTableWrite
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt JobTable.Arn
+              - Sid: InvokeWorker
+                Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${NamePrefix}-worker-lambda"
+
+  StatusLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${NamePrefix}-status-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: !Sub "${NamePrefix}-status-policy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: JobsTableRead
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                Resource: !GetAtt JobTable.Arn
+              - Sid: ReadCommandObjects
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !Sub "arn:aws:s3:::${PipelineBucket}"
+              - Sid: ReadCommandData
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub "arn:aws:s3:::${PipelineBucket}/*"
+
+  WorkerLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${NamePrefix}-worker-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: !Sub "${NamePrefix}-worker-policy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: JobsTableReadWrite
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Scan
+                Resource: !GetAtt JobTable.Arn
+              - Sid: InvokePipelineFunctions
+                Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${NamePrefix}-worker-lambda"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${NamePrefix}-text2image-lambda"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${NamePrefix}-glb2vox-lambda"
+              - Sid: PipelineBucketAccess
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !Sub "arn:aws:s3:::${PipelineBucket}"
+              - Sid: PipelineObjectsReadWrite
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub "arn:aws:s3:::${PipelineBucket}/*"
+              - Sid: InvokeSageMaker
+                Effect: Allow
+                Action:
+                  - sagemaker:InvokeEndpoint
+                  - sagemaker:InvokeEndpointAsync
+                Resource:
+                  - !If
+                    - CreateSageMakerResources
+                    - !Sub "arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:endpoint/${SageMakerEndpoint}"
+                    - !Sub "arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:endpoint/${ExistingSageMakerEndpointName}"
+
+  TextToImageLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${NamePrefix}-text2image-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: !Sub "${NamePrefix}-text2image-policy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: WriteImages
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub "arn:aws:s3:::${PipelineBucket}/*"
+              - Sid: InvokeBedrockTitan
+                Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource:
+                  - !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.titan-image-generator-v2:0"
+
+  GlbToVoxLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${NamePrefix}-glb2vox-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: !Sub "${NamePrefix}-glb2vox-policy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: PipelineBucketList
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !Sub "arn:aws:s3:::${PipelineBucket}"
+              - Sid: PipelineObjectReadWrite
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub "arn:aws:s3:::${PipelineBucket}/*"
+              - Sid: ReadDependencyLayer
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !If
+                  - UseExternalGlbLayerBucket
+                  - !Sub "arn:aws:s3:::${GlbLayerBucketName}/${GlbLayerObjectKey}"
+                  - !Sub "arn:aws:s3:::${PipelineBucket}/${GlbLayerObjectKey}"
+
+  SageMakerExecutionRole:
+    Type: AWS::IAM::Role
+    Condition: CreateSageMakerResources
+    Properties:
+      RoleName: !Sub "${NamePrefix}-sagemaker-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sagemaker.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSageMakerFullAccess
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+
+  SageMakerModel:
+    Type: AWS::SageMaker::Model
+    Condition: CreateSageMakerResources
+    Properties:
+      ModelName: !Sub "${NamePrefix}-hunyuan-model"
+      ExecutionRoleArn: !GetAtt SageMakerExecutionRole.Arn
+      PrimaryContainer:
+        Image: !Ref SageMakerImageUri
+
+  SageMakerEndpointConfig:
+    Type: AWS::SageMaker::EndpointConfig
+    Condition: CreateSageMakerResources
+    Properties:
+      EndpointConfigName: !Sub "${NamePrefix}-hunyuan-async-config"
+      ProductionVariants:
+        - VariantName: AllTraffic
+          ModelName: !Ref SageMakerModel
+          InstanceType: !Ref SageMakerInstanceType
+          InitialInstanceCount: 1
+          ManagedInstanceScaling:
+            Status: ENABLED
+            MinInstanceCount: 0
+            MaxInstanceCount: 1
+      AsyncInferenceConfig:
+        OutputConfig:
+          S3OutputPath: !Sub "s3://${PipelineBucket}/async-output/"
+          S3FailurePath: !Sub "s3://${PipelineBucket}/async-failures/"
+        ClientConfig:
+          MaxConcurrentInvocationsPerInstance: 1
+
+  SageMakerEndpoint:
+    Type: AWS::SageMaker::Endpoint
+    Condition: CreateSageMakerResources
+    Properties:
+      EndpointName: !Sub "${NamePrefix}-hunyuan-async"
+      EndpointConfigName: !Ref SageMakerEndpointConfig
+
+  SageMakerEndpointScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Condition: CreateSageMakerResources
+    DependsOn:
+      - SageMakerEndpoint
+    Properties:
+      ServiceNamespace: sagemaker
+      ScalableDimension: sagemaker:variant:DesiredInstanceCount
+      ResourceId: !Sub "endpoint/${SageMakerEndpoint}/variant/AllTraffic"
+      MinCapacity: 0
+      MaxCapacity: 1
+
+  SageMakerScaleOutFromZeroPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Condition: CreateSageMakerResources
+    Properties:
+      PolicyName: !Sub "${NamePrefix}-sm-scaleout-zero"
+      PolicyType: StepScaling
+      ScalingTargetId: !Ref SageMakerEndpointScalableTarget
+      StepScalingPolicyConfiguration:
+        AdjustmentType: ChangeInCapacity
+        MetricAggregationType: Maximum
+        Cooldown: 60
+        StepAdjustments:
+          - MetricIntervalLowerBound: 0
+            ScalingAdjustment: 1
+
+  SageMakerBacklogTargetTrackingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Condition: CreateSageMakerResources
+    Properties:
+      PolicyName: !Sub "${NamePrefix}-sm-backlog-target"
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref SageMakerEndpointScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 1.0
+        ScaleInCooldown: 600
+        ScaleOutCooldown: 60
+        CustomizedMetricSpecification:
+          Namespace: AWS/SageMaker
+          MetricName: ApproximateBacklogSizePerInstance
+          Statistic: Average
+          Dimensions:
+            - Name: EndpointName
+              Value: !Ref SageMakerEndpoint
+
+  SageMakerScaleOutFromZeroAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateSageMakerResources
+    Properties:
+      AlarmDescription: "Scale SageMaker async endpoint from zero when backlog exists and no capacity is running."
+      Namespace: AWS/SageMaker
+      MetricName: HasBacklogWithoutCapacity
+      Statistic: Maximum
+      Dimensions:
+        - Name: EndpointName
+          Value: !Ref SageMakerEndpoint
+      Period: 60
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref SageMakerScaleOutFromZeroPolicy
+
+  SubmitLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${NamePrefix}-submit-lambda"
+      Runtime: python3.12
+      Handler: createbuild_submit.handler
+      Role: !GetAtt SubmitLambdaRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Code: build/lambda/submit
+      Environment:
+        Variables:
+          JOB_TABLE: !Ref JobTable
+          WORKER_FUNCTION: !Ref WorkerLambda
+          JOB_TTL_SECONDS: !Ref JobTtlSeconds
+          DEFAULT_WORLD: !Ref DefaultWorld
+          WORKER_LOCK_KEY: !Ref WorkerLockKey
+          WORKER_LOCK_TTL_SECONDS: !Ref WorkerLockTtlSeconds
+          WORKER_LOCK_STALE_SECONDS: !Ref WorkerLockStaleSeconds
+          API_TOKEN: !Ref ApiToken
+          ALLOW_UNAUTHENTICATED_REQUESTS: !If [AllowUnauthenticatedApiCondition, "1", "0"]
+
+  StatusLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${NamePrefix}-status-lambda"
+      Runtime: python3.12
+      Handler: createbuild_status.handler
+      Role: !GetAtt StatusLambdaRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Code: build/lambda/status
+      Environment:
+        Variables:
+          JOB_TABLE: !Ref JobTable
+          COMMAND_BUCKET: !Ref PipelineBucket
+          SIGN_COMMAND_URLS: "1"
+          PRESIGN_TTL_SECONDS: "3600"
+          API_TOKEN: !Ref ApiToken
+          ALLOW_UNAUTHENTICATED_REQUESTS: !If [AllowUnauthenticatedApiCondition, "1", "0"]
+
+  TextToImageLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${NamePrefix}-text2image-lambda"
+      Runtime: python3.12
+      Handler: createbuild_text_to_image.lambda_handler
+      Role: !GetAtt TextToImageLambdaRole.Arn
+      Timeout: 180
+      MemorySize: 1024
+      Code: build/lambda/text_to_image
+      Environment:
+        Variables:
+          BEDROCK_REGION: !Ref AWS::Region
+          OUT_BUCKET: !Ref PipelineBucket
+          OUT_PREFIX: !Ref TextToImageOutputPrefix
+
+  GlbToVoxLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${NamePrefix}-glb2vox-lambda"
+      Runtime: python3.11
+      Handler: createbuild_glb_to_vox.lambda_handler
+      Role: !GetAtt GlbToVoxLambdaRole.Arn
+      Timeout: 900
+      MemorySize: 3008
+      Code: build/lambda/glb_to_vox
+      Environment:
+        Variables:
+          LAYER_BUCKET: !If [UseExternalGlbLayerBucket, !Ref GlbLayerBucketName, !Ref PipelineBucket]
+          LAYER_ZIP_KEY: !Ref GlbLayerObjectKey
+          OUTPUT_BUCKET: !Ref PipelineBucket
+          OUTPUT_PREFIX: !Ref GlbOutputPrefix
+          COORDINATE_MODE: !Ref GlbCoordinateMode
+          SMALL_TARGET_SPAN: !Ref GlbSmallTargetSpan
+          MEDIUM_TARGET_SPAN: !Ref GlbMediumTargetSpan
+          LARGE_TARGET_SPAN: !Ref GlbLargeTargetSpan
+          SMALL_SURFACE_SAMPLES: !Ref GlbSmallSurfaceSamples
+          MEDIUM_SURFACE_SAMPLES: !Ref GlbMediumSurfaceSamples
+          LARGE_SURFACE_SAMPLES: !Ref GlbLargeSurfaceSamples
+          MORPH_CLOSE_ITERATIONS: !Ref GlbMorphCloseIterations
+          MORPH_DILATE_ITERATIONS: !Ref GlbMorphDilateIterations
+          ALPHA_CUTOUT: !Ref GlbAlphaCutout
+          ALPHA_GLASS_MAX: !Ref GlbAlphaGlassMax
+          USE_TEXTURE_ALPHA: !Ref GlbUseTextureAlpha
+          KEEP_LARGEST_COMPONENT: !Ref GlbKeepLargestComponent
+          MIN_COMPONENT_VOXELS: !Ref GlbMinComponentVoxels
+          UP_AXIS_MODE: !Ref GlbUpAxisMode
+
+  WorkerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${NamePrefix}-worker-lambda"
+      Runtime: python3.12
+      Handler: createbuild_worker.handler
+      Role: !GetAtt WorkerLambdaRole.Arn
+      Timeout: 900
+      MemorySize: !Ref WorkerMemorySize
+      Code: build/lambda/worker
+      ReservedConcurrentExecutions: !If [UseWorkerReservedConcurrency, !Ref WorkerReservedConcurrency, !Ref AWS::NoValue]
+      Environment:
+        Variables:
+          JOB_TABLE: !Ref JobTable
+          TEXT2IMAGE_FUNCTION: !Ref TextToImageLambda
+          GLB_TO_VOX_FUNCTION: !Ref GlbToVoxLambda
+          HUNYUAN_ENDPOINT: !If [CreateSageMakerResources, !Ref SageMakerEndpoint, !Ref ExistingSageMakerEndpointName]
+          HUNYUAN_IO_BUCKET: !Ref PipelineBucket
+          ARTIFACT_BUCKET: !Ref PipelineBucket
+          COMMAND_BUCKET: !Ref PipelineBucket
+          COMMAND_PREFIX: !Ref CommandPrefix
+          COMMAND_CHUNK_SIZE: !Ref CommandChunkSize
+          PLACEMENT_PASSES: !Ref PlacementPasses
+          ENABLE_FORCELOAD: !Ref EnableForceload
+          MAX_FORCELOAD_CHUNKS: !Ref MaxForceloadChunks
+          ORIENTATION_ROTATE_Y_QUARTER_TURNS: !Ref OrientationRotateYQuarterTurns
+          SAGEMAKER_TIMEOUT_SECONDS: !Ref SageMakerTimeoutSeconds
+          SAGEMAKER_POLL_SECONDS: !Ref SageMakerPollSeconds
+          WORKER_LOCK_KEY: !Ref WorkerLockKey
+          WORKER_LOCK_TTL_SECONDS: !Ref WorkerLockTtlSeconds
+          WORKER_LOCK_STALE_SECONDS: !Ref WorkerLockStaleSeconds
+
+  SubmitLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${SubmitLambda}"
+      RetentionInDays: !Ref LogRetentionDays
+
+  StatusLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${StatusLambda}"
+      RetentionInDays: !Ref LogRetentionDays
+
+  WorkerLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${WorkerLambda}"
+      RetentionInDays: !Ref LogRetentionDays
+
+  TextToImageLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${TextToImageLambda}"
+      RetentionInDays: !Ref LogRetentionDays
+
+  GlbToVoxLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${GlbToVoxLambda}"
+      RetentionInDays: !Ref LogRetentionDays
+
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub "${NamePrefix}-http-api"
+      ProtocolType: HTTP
+
+  SubmitIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationMethod: POST
+      PayloadFormatVersion: "2.0"
+      IntegrationUri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${SubmitLambda.Arn}/invocations"
+
+  StatusIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationMethod: POST
+      PayloadFormatVersion: "2.0"
+      IntegrationUri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${StatusLambda.Arn}/invocations"
+
+  SubmitRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "POST /build"
+      Target: !Sub "integrations/${SubmitIntegration}"
+
+  StatusRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "GET /build/status/{jobId}"
+      Target: !Sub "integrations/${StatusIntegration}"
+
+  ApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: !Ref ApiStageName
+      AutoDeploy: true
+
+  SubmitPermissionForApi:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref SubmitLambda
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/POST/build"
+
+  StatusPermissionForApi:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref StatusLambda
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/GET/build/status/*"
+
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.42.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${NamePrefix}-vpc"
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${NamePrefix}-igw"
+
+  VpcGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.42.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${NamePrefix}-public-a"
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${NamePrefix}-public-rt"
+
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  MinecraftSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${NamePrefix} Minecraft server ingress"
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 25565
+          ToPort: 25565
+          CidrIp: !Ref MinecraftIngressCidr
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AdminIngressCidr
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub "${NamePrefix}-mc-sg"
+
+  MinecraftEc2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${NamePrefix}-minecraft-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub "${NamePrefix}-minecraft-assets-read"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ListAssetsBucket
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !Sub "arn:aws:s3:::${AssetsBucket}"
+              - Sid: ReadAssetsObjects
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub "arn:aws:s3:::${AssetsBucket}/*"
+
+  MinecraftEc2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub "${NamePrefix}-minecraft-profile"
+      Roles:
+        - !Ref MinecraftEc2Role
+
+  MinecraftInstance:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - ApiStage
+    Properties:
+      ImageId: !Ref MinecraftAmiId
+      InstanceType: !Ref MinecraftInstanceType
+      SubnetId: !Ref PublicSubnetA
+      SecurityGroupIds:
+        - !Ref MinecraftSecurityGroup
+      IamInstanceProfile: !Ref MinecraftEc2InstanceProfile
+      KeyName: !If [UseProvidedEc2KeyPair, !Ref Ec2KeyPairName, !Ref AWS::NoValue]
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: !Ref MinecraftRootVolumeGiB
+            VolumeType: gp3
+            DeleteOnTermination: true
+      UserData:
+        Fn::Base64:
+          Fn::Sub: |
+            #!/bin/bash
+            set -euo pipefail
+
+            REGION='${AWS::Region}'
+            ASSET_BUCKET='${AssetsBucket}'
+            ASSET_PREFIX='${AssetsPrefix}'
+            SUBMIT_URL='https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/${ApiStageName}/build'
+            STATUS_URL='https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/${ApiStageName}/build/status'
+            API_TOKEN='${ApiToken}'
+            BOOTSTRAP_URI='s3://${AssetsBucket}/${AssetsPrefix}/bootstrap/paper_user_data.sh'
+
+            if command -v dnf >/dev/null 2>&1; then
+              dnf install -y awscli
+            else
+              yum install -y awscli
+            fi
+
+            for attempt in $(seq 1 90); do
+              if aws s3 cp "$BOOTSTRAP_URI" /tmp/paper_user_data.sh --region "$REGION"; then
+                chmod +x /tmp/paper_user_data.sh
+                REGION="$REGION" \
+                ASSET_BUCKET="$ASSET_BUCKET" \
+                ASSET_PREFIX="$ASSET_PREFIX" \
+                CREATEBUILD_SUBMIT_URL="$SUBMIT_URL" \
+                CREATEBUILD_STATUS_URL="$STATUS_URL" \
+                CREATEBUILD_API_TOKEN="$API_TOKEN" \
+                /tmp/paper_user_data.sh
+                exit 0
+              fi
+              sleep 10
+            done
+
+            echo "ERROR: bootstrap script not found at $BOOTSTRAP_URI" >&2
+            exit 1
+      Tags:
+        - Key: Name
+          Value: !Sub "${NamePrefix}-minecraft-instance"
+
+  MinecraftElasticIp:
+    Type: AWS::EC2::EIP
+    Condition: AllocateElasticIpCondition
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${NamePrefix}-minecraft-eip"
+
+  MinecraftElasticIpAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Condition: AllocateElasticIpCondition
+    Properties:
+      InstanceId: !Ref MinecraftInstance
+      EIP: !Ref MinecraftElasticIp
+
+Outputs:
+  NamePrefix:
+    Value: !Ref NamePrefix
+
+  AssetsBucketName:
+    Value: !Ref AssetsBucket
+
+  AssetsPrefix:
+    Value: !Ref AssetsPrefix
+
+  PipelineBucketName:
+    Value: !Ref PipelineBucket
+
+  JobTableName:
+    Value: !Ref JobTable
+
+  SubmitLambdaName:
+    Value: !Ref SubmitLambda
+
+  StatusLambdaName:
+    Value: !Ref StatusLambda
+
+  WorkerLambdaName:
+    Value: !Ref WorkerLambda
+
+  TextToImageLambdaName:
+    Value: !Ref TextToImageLambda
+
+  GlbToVoxLambdaName:
+    Value: !Ref GlbToVoxLambda
+
+  ApiId:
+    Value: !Ref HttpApi
+
+  SubmitUrl:
+    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/${ApiStageName}/build"
+
+  StatusUrlBase:
+    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/${ApiStageName}/build/status"
+
+  SageMakerEndpointNameInUse:
+    Value: !If [CreateSageMakerResources, !Ref SageMakerEndpoint, !Ref ExistingSageMakerEndpointName]
+
+  MinecraftInstanceId:
+    Value: !Ref MinecraftInstance
+
+  MinecraftPublicIp:
+    Value: !If [AllocateElasticIpCondition, !Ref MinecraftElasticIp, !GetAtt MinecraftInstance.PublicIp]

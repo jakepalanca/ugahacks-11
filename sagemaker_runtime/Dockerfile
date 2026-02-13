@@ -1,0 +1,177 @@
+FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+WORKDIR /app
+
+# Base deps + OpenGL + Blender dependencies
+RUN apt-get update && apt-get install -y \
+    software-properties-common curl ca-certificates git wget \
+    build-essential pkg-config \
+    libgl1 libglib2.0-0 \
+    libopengl0 libglx0 libglvnd0 libegl1 libglu1-mesa \
+    libxkbcommon0 libxcb-cursor0 libxrender1 libxi6 libxfixes3 \
+    libxxf86vm1 libxkbcommon-x11-0 libsm6 libice6 \
+    xvfb \
+  && rm -rf /var/lib/apt/lists/*
+
+# Install Blender for bpy
+RUN wget -q https://mirror.clarkson.edu/blender/release/Blender4.2/blender-4.2.0-linux-x64.tar.xz \
+    && tar -xf blender-4.2.0-linux-x64.tar.xz \
+    && mv blender-4.2.0-linux-x64 /opt/blender \
+    && rm blender-4.2.0-linux-x64.tar.xz
+
+ENV PATH="/opt/blender:$PATH"
+ENV BLENDER_PATH="/opt/blender"
+
+# Python 3.11 on Ubuntu 22.04
+RUN add-apt-repository ppa:deadsnakes/ppa && apt-get update && apt-get install -y \
+    python3.11 python3.11-venv python3.11-dev \
+  && rm -rf /var/lib/apt/lists/*
+
+# Create venv
+RUN python3.11 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+RUN python --version && pip --version
+RUN pip install --upgrade pip setuptools wheel
+
+# Clone Hunyuan3D repo
+RUN git clone https://github.com/Tencent-Hunyuan/Hunyuan3D-2.1.git .
+
+# Patch outdated package versions - remove bpy from requirements (we'll use Blender's)
+RUN sed -i 's/^bpy==.*$/# bpy - using system Blender/' requirements.txt && \
+    sed -i 's/^pymeshlab==2022.2.post3$/pymeshlab>=2025.7/' requirements.txt
+
+# Torch cu124
+RUN pip install \
+  torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 \
+  --index-url https://download.pytorch.org/whl/cu124
+
+# Install requirements
+RUN pip install \
+  --index-url https://pypi.org/simple \
+  --extra-index-url https://download.blender.org/pypi/ \
+  -r requirements.txt
+
+# Pre-fetch Hugging Face model artifacts during image build to avoid
+# cold-start runtime downloads and HF anonymous rate limits (HTTP 429).
+RUN python - <<'PY'
+import os
+import time
+from huggingface_hub import snapshot_download
+
+def download_with_retry(repo_id, **kwargs):
+    for attempt in range(8):
+        try:
+            return snapshot_download(repo_id=repo_id, **kwargs)
+        except Exception as exc:
+            if attempt == 7:
+                raise
+            wait_s = min(60, 2 ** attempt)
+            print(f"snapshot_download failed ({type(exc).__name__}): {exc}")
+            print(f"retrying in {wait_s}s...")
+            time.sleep(wait_s)
+
+# Shape model is loaded by hy3dshape from ~/.cache/hy3dgen/<repo>/<subfolder>.
+shape_local_dir = os.path.expanduser("~/.cache/hy3dgen/tencent/Hunyuan3D-2.1")
+os.makedirs(shape_local_dir, exist_ok=True)
+download_with_retry(
+    "tencent/Hunyuan3D-2.1",
+    allow_patterns=["hunyuan3d-dit-v2-1/*"],
+    local_dir=shape_local_dir,
+)
+
+# Paint model loader uses huggingface_hub default cache path.
+download_with_retry(
+    "tencent/Hunyuan3D-2.1",
+    allow_patterns=["hunyuan3d-paintpbr-v2-1/*"],
+)
+PY
+
+# Install bpy from PyPI + make Blender's bundled Embree libs available
+ENV LD_LIBRARY_PATH="/opt/blender/lib:${LD_LIBRARY_PATH}"
+# PyPI bpy 4.2.0 links against Embree 4.x SYCL symbols (rtcIsSYCLDeviceSupported)
+# that aren't in the portable Blender release.  Provide a no-op stub so bpy loads.
+RUN printf '#include <stddef.h>\nint rtcIsSYCLDeviceSupported(void *d){return 0;}\nvoid* rtcNewSYCLDevice(void *c,const char *cfg){return NULL;}\n' \
+      > /tmp/embree_sycl_stub.c \
+    && gcc -shared -fPIC -o /usr/lib/libembree_sycl_stub.so /tmp/embree_sycl_stub.c \
+    && rm /tmp/embree_sycl_stub.c
+ENV LD_PRELOAD="/usr/lib/libembree_sycl_stub.so"
+RUN pip install bpy==4.2.0
+
+# Shim: torchvision.transforms.functional_tensor was removed in torchvision 0.18+
+# but basicsr/realesrgan still imports rgb_to_grayscale from there
+RUN python -c "\
+import os, torchvision; \
+p = os.path.join(os.path.dirname(torchvision.__file__), 'transforms', 'functional_tensor.py'); \
+open(p,'w').write('from torchvision.transforms.functional import rgb_to_grayscale\n')"
+
+# docker build typically has no visible GPU, so torch can't auto-detect archs.
+# Set a default list covering common SageMaker NVIDIA families.
+ENV TORCH_CUDA_ARCH_LIST="7.5;8.0;8.6;8.9;9.0"
+
+# Build & install the custom CUDA rasterizer for hy3dpaint.
+# Its setup imports torch at build-time, so disable PEP 517 build isolation.
+RUN cd /app/hy3dpaint/custom_rasterizer && pip install --no-build-isolation .
+
+# Build pybind11 mesh inpaint extension used by hy3dpaint paint stage.
+# Without this, runtime falls through and meshVerticeInpaint is undefined.
+RUN pip install pybind11 && \
+    cd /app/hy3dpaint/DifferentiableRenderer && \
+    EXT_SUFFIX="$(python3.11-config --extension-suffix)" && \
+    c++ -O3 -Wall -shared -std=c++11 -fPIC \
+      $(python -m pybind11 --includes) \
+      mesh_inpaint_processor.cpp \
+      -o "mesh_inpaint_processor${EXT_SUFFIX}" && \
+    python -c "import sys; sys.path.insert(0, '/app/hy3dpaint'); from DifferentiableRenderer.mesh_inpaint_processor import meshVerticeInpaint; print('mesh_inpaint_processor OK')"
+
+# Patch: skip extremely slow meshVerticeInpaint (takes hours per mesh).
+# Keeps cv2.inpaint (Navier-Stokes, seconds) for adequate hole-filling.
+# Controlled by SKIP_MESH_INPAINT env var at runtime.
+# See: https://github.com/Tencent-Hunyuan/Hunyuan3D-2.1/issues/139
+RUN python3 -c "\
+import pathlib, re; \
+p = pathlib.Path('/app/hy3dpaint/DifferentiableRenderer/MeshRender.py'); \
+src = p.read_text(); \
+src = 'import os as _os\n' + src; \
+src = src.replace( \
+    'if vertex_inpaint:', \
+    'if vertex_inpaint and _os.environ.get(\"SKIP_MESH_INPAINT\", \"0\") != \"1\":', \
+    1 \
+); \
+p.write_text(src); \
+print('Patched MeshRender.py: meshVerticeInpaint gated by SKIP_MESH_INPAINT env var')"
+
+# Download RealESRGAN checkpoint needed by hy3dpaint super-resolution
+RUN mkdir -p /app/ckpt && \
+    wget -q -O /app/ckpt/RealESRGAN_x4plus.pth \
+      https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth
+
+# Flask for SageMaker serving
+RUN pip install flask boto3
+
+# Copy serving script
+COPY sagemaker_runtime/inference_server.py /app/inference_server.py
+
+# SageMaker expects container to listen on 8080
+EXPOSE 8080
+
+# Environment for SageMaker
+ENV MODEL_PATH="tencent/Hunyuan3D-2.1"
+ENV PRELOAD_MODELS="0"
+ENV PAINT_QUALITY="medium"
+ENV PAINT_MAX_NUM_VIEW="6"
+ENV PAINT_RESOLUTION="512"
+ENV PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+ENV UNLOAD_SHAPE_BEFORE_PAINT="1"
+ENV UNLOAD_PAINT_BEFORE_SHAPE="1"
+ENV KEEP_PAINT_PIPELINE_LOADED="0"
+ENV DISABLE_CUDNN_FOR_PAINT="1"
+ENV SKIP_MESH_INPAINT="1"
+
+# Use xvfb for headless OpenGL
+ENV DISPLAY=:99
+
+# Run the Flask server with virtual display
+ENTRYPOINT ["python", "/app/inference_server.py"]

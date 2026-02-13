@@ -58,7 +58,7 @@ We built a multi-stage pipeline leveraging AWS. Here is the flow from text to bl
 
 ### Minecraft / Game Side
 - **Minecraft Java Server** (Vanilla / Paper / Spigot — *specify which you used*)
-- **Java Plugin / Mod** (implements '/createbuild', wand interaction, and block placement — *specify: Paper plugin vs Forge/NeoForge mod*)
+- **Java Plugin / Texture Pack Integration** (implements '/createbuild', wand interaction, and block placement — *specify your exact server/plugin stack*)
 
 ### Cloud / Backend
 - **AWS Lambda** (initial attempt; limited by dependency size/runtime)
@@ -86,8 +86,6 @@ We used and integrated the following public tools/frameworks/APIs:
 - **HunYuan3D 2.1** (image-to-3D generation)
 - **AWS SageMaker, Lambda, S3, IAM** (cloud infrastructure and deployment)
 - **Minecraft Java Edition server API / modding framework** (*Paper/Spigot API or NeoForge/Forge/Fabric — fill in what you used*)
-
-> Add a “References” section with links to specific repos/docs if required by your instructor.
 
 ---
 
@@ -138,18 +136,40 @@ Seeing the very first AI-generated structure appear in the Minecraft world prove
 
 ## How to Run
 1. Open 'Minecraft (Java Edition)'.
-2. Join the server: 'mc.jakepalanca.com'
-3. Once in-game, run the command: '/createbuild'
-4. A 'wand' will appear in your inventory—equip it and 'right-click a block' to select the destination where the model should be built.
-5. In chat, type the 'prompt' for what you want to generate (e.g., '"a giant bulldog with a top hat"') and press 'Enter'.
-6. In chat, type the desired 'size': 'small', 'medium', or 'large', then press 'Enter'.
-7. Wait a few minutes—your structure will generate and load into the world at the selected location.
+2. Deploy the stack (`infra/cloudformation/scripts/deploy.sh`) and use the `MinecraftPublicIp` output (Elastic IP when `ALLOCATE_ELASTIC_IP=true`).
+3. Join `<MinecraftPublicIp>:25565` from your Minecraft client.
+4. Once in-game, run the command: '/createbuild'
+5. A 'wand' will appear in your inventory—equip it and 'right-click a block' to select the destination where the model should be built.
+6. In chat, type the 'prompt' for what you want to generate (e.g., '"a giant bulldog with a top hat"') and press 'Enter'.
+7. In chat, type the desired 'size': 'small', 'medium', or 'large', then press 'Enter'.
+8. Wait a few minutes—your structure will generate and load into the world at the selected location.
 
+Resolve the current Minecraft endpoint (Elastic IP) from CloudFormation:
+```bash
+aws cloudformation describe-stacks \
+  --stack-name <stack-name> \
+  --region <aws-region> \
+  --query "Stacks[0].Outputs[?OutputKey=='MinecraftPublicIp'].OutputValue | [0]" \
+  --output text
+```
+
+## Infrastructure Deployment 
+- Full-stack AWS deployment (backend + Minecraft server + teardown):
+  - `infra/cloudformation/README.md`
+- Minecraft AI Builder (SageMaker runtime) details:
+  - `sagemaker_runtime/README.md`
+- Detailed pipeline/ops notes:
+  - `docs/ABOUT.md`
+- Per-service docs (Lambdas, SageMaker, API, IAM, EC2, S3, DynamoDB):
+  - `docs/services/README.md`
+- Deploy:
+  - `cd infra/cloudformation`
+  - `./scripts/deploy.sh`
+- Destroy everything:
+  - `cd infra/cloudformation`
+  - `./scripts/destroy.sh`
+
+- Repository structure map:
+  - `docs/REPO_STRUCTURE.md`
 
 ---
-
-## References
-- HunYuan3D 2.1 documentation/repo
-- AWS Bedrock / Titan Image Generator docs
-- Paper/Spigot/NeoForge documentation
-- Any voxelization references used

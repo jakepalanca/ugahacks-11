@@ -7,3 +7,32 @@
 .env.development
 .env.test
 .env.production
+
+# Generated infra artifacts
+infra/cloudformation/build/
+
+# Downloaded lambda dumps
+minecraft_runtime/lambda/downloaded/
+
+# Python cache artifacts
+__pycache__/
+**/__pycache__/
+*.pyc
+.pyo
+*.pyd
+*.py[cod]
+.pytest_cache/
+scripts/sagemaker_runtime/__pycache__/
+sagemaker_runtime/__pycache__/
+
+# Java/Maven build outputs
+minecraft_runtime/plugin/target/
+
+# OS/editor metadata
+.DS_Store
+.claude/
+.vscode/
+.idea/
+.cursor/
+.cursorrules
+.cursorignore
