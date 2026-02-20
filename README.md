@@ -57,8 +57,8 @@ We built a multi-stage pipeline leveraging AWS. Here is the flow from text to bl
 ## Tools Utilized
 
 ### Minecraft / Game Side
-- **Minecraft Java Server** (Vanilla / Paper / Spigot — *specify which you used*)
-- **Java Plugin / Texture Pack Integration** (implements '/createbuild', wand interaction, and block placement — *specify your exact server/plugin stack*)
+- **Minecraft Java Server** (Paper)
+- **Java Plugin / Texture Pack Integration** (implements '/createbuild', wand interaction, and block placement)
 
 ### Cloud / Backend
 - **AWS Lambda** (initial attempt; limited by dependency size/runtime)
@@ -85,7 +85,7 @@ We used and integrated the following public tools/frameworks/APIs:
 - **Amazon Titan Image Generator** (AWS Bedrock model)
 - **HunYuan3D 2.1** (image-to-3D generation)
 - **AWS SageMaker, Lambda, S3, IAM** (cloud infrastructure and deployment)
-- **Minecraft Java Edition server API / modding framework** (*Paper/Spigot API or NeoForge/Forge/Fabric — fill in what you used*)
+- **Minecraft Java Edition server API / modding framework** (Paper)
 
 ---
 
