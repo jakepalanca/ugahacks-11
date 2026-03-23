@@ -1,4 +1,4 @@
-# Magic Minecraft Builder
+# AI Minecraft Builder
 
 ## Team Members
 - **Jake Palanca**
@@ -9,7 +9,7 @@
 ---
 
 ## Purpose
-**Magic Minecraft Builder** turns **text into structures inside Minecraft**.
+**AI Minecraft Builder** turns **text into structures inside Minecraft**.
 
 Instead of placing blocks manually, a player joins our server, runs a command to receive a **magical wand**, clicks the ground, types a prompt like *"a giant bulldog with a top hat,"* chooses a scale, and the system generates a **voxelized 3D model** and builds it **next to the player** in-game.
 
